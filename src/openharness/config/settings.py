@@ -1,10 +1,10 @@
-"""Settings model and loading logic for OpenHarness.
+"""OpenHarness 的设置模型和加载逻辑。
 
-Settings are resolved with the following precedence (highest first):
-1. CLI arguments
-2. Environment variables (ANTHROPIC_API_KEY, OPENHARNESS_MODEL, etc.)
-3. Config file (~/.openharness/settings.json)
-4. Defaults
+设置按以下优先级解析（从高到低）：
+1. CLI 参数
+2. 环境变量（ANTHROPIC_API_KEY、OPENHARNESS_MODEL 等）
+3. 配置文件（~/.openharness/settings.json）
+4. 默认值
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from openharness.permissions.modes import PermissionMode
 
 
 class PathRuleConfig(BaseModel):
-    """A glob-pattern path permission rule."""
+    """A glob-pattern path permission rule.  路径访问规则。"""
 
     pattern: str
     allow: bool = True
@@ -33,10 +33,10 @@ class PermissionSettings(BaseModel):
     """Permission mode configuration."""
 
     mode: PermissionMode = PermissionMode.DEFAULT
-    allowed_tools: list[str] = Field(default_factory=list)
-    denied_tools: list[str] = Field(default_factory=list)
-    path_rules: list[PathRuleConfig] = Field(default_factory=list)
-    denied_commands: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list) #允许的工具白名单
+    denied_tools: list[str] = Field(default_factory=list)  #禁止的工具黑名单
+    path_rules: list[PathRuleConfig] = Field(default_factory=list) #路径访问规则
+    denied_commands: list[str] = Field(default_factory=list)  # 禁止的命令列表
 
 
 class MemorySettings(BaseModel):
@@ -76,15 +76,15 @@ class SandboxSettings(BaseModel):
 class ProviderProfile(BaseModel):
     """Named provider workflow configuration."""
 
-    label: str
-    provider: str
-    api_format: str
-    auth_source: str
-    default_model: str
-    base_url: str | None = None
-    last_model: str | None = None
-    credential_slot: str | None = None
-    allowed_models: list[str] = Field(default_factory=list)
+    label: str                              # 显示名称（如 "Anthropic-Compatible API"）
+    provider: str                           # 提供商类型（如 "anthropic", "openai"）
+    api_format: str                         # API 格式（如 "anthropic", "openai"）
+    auth_source: str                        # 认证方式（如 API Key、OAuth）
+    default_model: str                      # 默认模型（如 "claude-sonnet-4-6"）
+    base_url: str | None = None             # API 端点 URL（可选）
+    last_model: str | None = None           # 用户上次使用的模型
+    credential_slot: str | None = None      # 凭据存储槽位
+    allowed_models: list[str] = Field(default_factory=list)   # 允许使用的模型列表
 
     @property
     def resolved_model(self) -> str:
@@ -413,13 +413,22 @@ class Settings(BaseModel):
     verbose: bool = False
 
     def merged_profiles(self) -> dict[str, ProviderProfile]:
-        """Return the saved profiles merged over the built-in catalog."""
+        """Return the saved profiles merged over the built-in catalog.
+
+        返回用户保存的配置文件与内置目录合并后的结果。
+        用户的自定义配置会覆盖内置的默认配置。
+        """
+        # 1. 获取内置的 provider profiles 目录（默认配置）
         merged = default_provider_profiles()
+
+        # 2. 用用户保存的 profiles 更新内置目录
         merged.update(
             {
                 name: (
+                    # 如果已经是 ProviderProfile 实例，使用深度拷贝避免修改原对象
                     profile.model_copy(deep=True)
                     if isinstance(profile, ProviderProfile)
+                    # 如果是字典（从 JSON 加载的），验证并转换为 ProviderProfile
                     else ProviderProfile.model_validate(profile)
                 )
                 for name, profile in self.profiles.items()
@@ -428,7 +437,10 @@ class Settings(BaseModel):
         return merged
 
     def resolve_profile(self, name: str | None = None) -> tuple[str, ProviderProfile]:
-        """Return the active provider profile."""
+        """
+        Return the active provider profile.
+        返回当前有效的提供商配置文件
+        """
         profiles = self.merged_profiles()
         profile_name = (name or self.active_profile or "").strip() or "claude-api"
         if profile_name not in profiles:
@@ -438,7 +450,10 @@ class Settings(BaseModel):
         return profile_name, profiles[profile_name].model_copy(deep=True)
 
     def materialize_active_profile(self) -> Settings:
-        """Project the active profile back onto legacy flat settings fields."""
+        """
+        Project the active profile back onto legacy flat settings fields.
+        将当前配置映射回传统的扁平设置字段。
+        """
         profile_name, profile = self.resolve_profile()
         configured_model = (profile.last_model or "").strip() or profile.default_model
         return self.model_copy(
@@ -463,6 +478,10 @@ class Settings(BaseModel):
         This preserves compatibility for callers that still construct `Settings`
         by setting top-level `provider` / `api_format` / `base_url` / `model`
         directly before the profile layer is used everywhere.
+
+        将旧的扁平 provider 字段折叠回活跃配置文件。
+        这保持了与仍然通过直接设置顶层 `provider` / `api_format` / `base_url` / `model`
+        来构造 `Settings` 的调用者的兼容性，在 profile 层被全面使用之前。
         """
         profile_name, profile = self.resolve_profile()
         next_provider = (self.provider or "").strip() or profile.provider
@@ -747,11 +766,11 @@ def load_settings(config_path: Path | None = None) -> Settings:
 
 
 def save_settings(settings: Settings, config_path: Path | None = None) -> None:
-    """Persist settings to the config file.
+    """Persist settings to the config file. 将设置保存至配置文件中。
 
     Args:
-        settings: Settings instance to save.
-        config_path: Path to write. If None, uses the default location.
+        settings: Settings instance to save. 要保存的设置实例。
+        config_path: Path to write. If None, uses the default location. 写入路径。若为无，则使用默认位置。
     """
     if config_path is None:
         from openharness.config.paths import get_config_file_path
