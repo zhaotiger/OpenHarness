@@ -103,10 +103,10 @@ class ReactBackendHost:
         )
         await self._emit(self._status_snapshot())   #发送 state_snapshot 事件
 
-        reader = asyncio.create_task(self._read_requests())
+        reader = asyncio.create_task(self._read_requests()) #  接收控制台输入 放入 _request_queue 队列
         try:
             while self._running:
-                request = await self._request_queue.get()
+                request = await self._request_queue.get()   # 处理 _request_queue 队列中的消息
                 if request.type == "shutdown":
                     await self._emit(BackendEvent(type="shutdown"))
                     break
@@ -125,7 +125,7 @@ class ReactBackendHost:
                     await self._handle_select_command(request.command or "")
                     continue
                 if request.type == "apply_select_command":
-                    if self._busy:
+                    if self._busy:                      # 确保同时只有一个命令在执行
                         await self._emit(BackendEvent(type="error", message="Session is busy"))
                         continue
                     self._busy = True
@@ -168,6 +168,7 @@ class ReactBackendHost:
     async def _read_requests(self) -> None:
         while True:
             raw = await asyncio.to_thread(sys.stdin.buffer.readline)
+            # 如果读到空数据（EOF），说明前端断开连接
             if not raw:
                 await self._request_queue.put(FrontendRequest(type="shutdown"))
                 return
@@ -175,23 +176,35 @@ class ReactBackendHost:
             if not payload:
                 continue
             try:
+                # 将 JSON 字符串解析为 FrontendRequest 对象
                 request = FrontendRequest.model_validate_json(payload)
             except Exception as exc:  # pragma: no cover - defensive protocol handling
                 await self._emit(BackendEvent(type="error", message=f"Invalid request: {exc}"))
                 continue
+            # 将请求放入队列，供后续处理
             await self._request_queue.put(request)
 
     async def _process_line(self, line: str, *, transcript_line: str | None = None) -> bool:
         assert self._bundle is not None
+        # 确认收到用户消息
         await self._emit(
             BackendEvent(type="transcript_item", item=TranscriptItem(role="user", text=transcript_line or line))
         )
-
+        # UI 层面的"打印函数"
         async def _print_system(message: str) -> None:
             await self._emit(
                 BackendEvent(type="transcript_item", item=TranscriptItem(role="system", text=message))
             )
-
+        """
+            事件转换器 (将后端的内部事件转换为前端可显示的事件)
+        
+          | 后端事件（内部）       | 前端事件           | 作用                  |
+          |------------------------|--------------------|-----------------------|
+          | AssistantTextDelta     | assistant_delta    | AI 流式输出的增量文本 |
+          | AssistantTurnComplete  | assistant_complete | AI 回复完成           |
+          | ToolExecutionStarted   | tool_started       | 工具开始执行          |
+          | ToolExecutionCompleted | tool_completed     | 工具执行完成          |
+        """
         async def _render_event(event: StreamEvent) -> None:
             if isinstance(event, AssistantTextDelta):
                 await self._emit(BackendEvent(type="assistant_delta", message=event.text))
@@ -283,9 +296,9 @@ class ReactBackendHost:
             render_event=_render_event,
             clear_output=_clear_output,
         )
-        await self._emit(self._status_snapshot())
-        await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
-        await self._emit(BackendEvent(type="line_complete"))
+        await self._emit(self._status_snapshot())                               # 发送当前状态
+        await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))  # 发送当前任务列表
+        await self._emit(BackendEvent(type="line_complete"))        # 单行处理完成（用户输入的一行已处理完毕）
         return should_continue
 
     async def _apply_select_command(self, command_name: str, value: str) -> bool:
@@ -693,7 +706,7 @@ class ReactBackendHost:
 
     async def _emit(self, event: BackendEvent) -> None:
         log.debug("emit event: type=%s tool=%s", event.type, getattr(event, "tool_name", None))
-        async with self._write_lock:
+        async with self._write_lock:                # 获取锁自动释放 （确保同一时刻只有一个协程能写入标准输出，避免数据交错混乱。）
             payload = _PROTOCOL_PREFIX + event.model_dump_json() + "\n"
             buffer = getattr(sys.stdout, "buffer", None)
             if buffer is not None:

@@ -13,8 +13,18 @@ from openharness.tasks.types import TaskRecord
 
 
 class FrontendRequest(BaseModel):
-    """One request sent from the React frontend to the Python backend."""
-
+    """One request sent from the React frontend to the Python backend."""       #从前端发送给 Python 后端的一个 消息对象封装。
+    """
+      | 请求类型             | 处理方式                     | 说明                           |
+      |----------------------|------------------------------|--------------------------------|
+      | shutdown             | 发送 shutdown 事件并退出循环 | 前端主动断开连接               |
+      | permission_response  | 设置 Future 结果             | 响应后端的权限请求（弹窗确认）  |
+      | question_response    | 设置 Future 结果             | 响应后端的问题请求（弹窗提问）  |
+      | list_sessions        | 调用处理方法                 | 列出所有会话                 |
+      | select_command       | 调用处理方法                 | 选择要执行的命令              |
+      | apply_select_command | 执行命令并控制会话忙碌状态   | 实际执行选中的命令               |
+      | submit_line          | 处理用户输入                  | 提交用户输入的一行内容        |
+    """
     type: Literal[
         "submit_line",
         "permission_response",
@@ -65,6 +75,26 @@ class TaskSnapshot(BaseModel):
 class BackendEvent(BaseModel):
     """One event sent from the Python backend to the React frontend.""" # 从 Python 后端发送的一次事件传到了 React 前端。 消息对象封装
 
+    """
+        响应类型说明
+        "ready",              # 后端启动完成，通知前端已准备就绪
+        "state_snapshot",     # 应用状态快照（包含 app_state、mcp_servers、bridge_sessions）
+        "tasks_snapshot",     # 任务列表快照
+        "transcript_item",    # 会话记录项（收到的内容返回给前端）
+        "assistant_delta",    # 助手流式输出增量数据（用于实现打字效果）
+        "assistant_complete", # 助手响应完成（标志整个响应结束）
+        "line_complete",      # 单行处理完成（用户输入的一行已处理完毕）
+        "tool_started",       # 工具开始执行（通知前端显示工具执行状态）
+        "tool_completed",     # 工具执行完成（包含工具名称、输入、输出等信息）
+        "clear_transcript",   # 清除会话记录（前端清空对话历史）
+        "modal_request",      # 模态框请求（权限确认或问题弹窗）
+        "select_request",     # 选择请求（让用户从选项中选择）
+        "todo_update",        # 待办事项更新（todo 列表变化通知）
+        "plan_mode_change",   # 计划模式变更（进入/退出计划模式）
+        "swarm_status",       # 群组状态更新（多协作任务状态）
+        "error",              # 错误事件（后端发生的错误）
+        "shutdown",           # 关闭事件（后端即将关闭）
+    """
     type: Literal[
         "ready",
         "state_snapshot",

@@ -76,6 +76,10 @@ async def run_query(
     the engine first tries a cheap microcompact (clearing old tool result
     content) and, if that is not enough, performs a full LLM-based
     summarization of older messages.
+    持续进行对话循环，直到模型不再请求使用工具为止。
+    每次回合开始时都会进行自动压缩检查。当......的时候
+    估计的标记数量超过了模型的自动压缩阈值，
+    引擎首先会尝试一种较为简单的微压缩（清除旧的工具结果内容），如果这还不够，就会对较早的消息进行基于大型语言模型的完整摘要处理。
     """
     from openharness.services.compact import (
         AutoCompactState,

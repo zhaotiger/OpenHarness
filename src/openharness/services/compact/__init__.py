@@ -318,6 +318,23 @@ async def compact_conversation(
 
     Returns:
         The new compacted message list.
+
+    通过调用 LLM 生成摘要来压缩消息。
+        1. 首先进行微压缩（低成本的 Token 缩减）。
+        2. 将消息拆分为旧消息（用于摘要）和最近的消息（用于保留）。
+        3. 使用压缩提示词调用 LLM 以获取结构化的摘要。
+        4. 用“摘要 + 保留的最近消息”替换旧消息。
+    参数:
+        messages: 完整的对话历史记录。
+        api_client: 一个 ``AnthropicApiClient`` 或兼容的客户端，用于摘要调用。
+        model: 用于生成摘要的模型 ID。
+        system_prompt: 用于摘要调用的系统提示词。
+        preserve_recent: 需要逐字保留的最近消息的数量。
+        custom_instructions: 用于摘要提示词的可选额外指令。
+        suppress_follow_up: 如果为 True，则指示模型不要询问后续问题。
+
+    返回:
+        新的压缩后的消息列表。
     """
     from openharness.api.client import ApiMessageRequest, ApiMessageCompleteEvent
 

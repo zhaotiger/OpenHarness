@@ -259,7 +259,7 @@ _DEFAULT_MANAGER_KEY: str | None = None
 
 
 def get_task_manager() -> BackgroundTaskManager:
-    """Return the singleton task manager."""
+    """Return the singleton task manager."""        #返回单例任务管理器
     global _DEFAULT_MANAGER, _DEFAULT_MANAGER_KEY
     current_key = str(get_tasks_dir().resolve())
     if _DEFAULT_MANAGER is None or _DEFAULT_MANAGER_KEY != current_key:

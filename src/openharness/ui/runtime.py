@@ -399,12 +399,12 @@ async def handle_line(
     render_event: StreamRenderer,
     clear_output: ClearHandler,
 ) -> bool:
-    """Handle one submitted line for either headless or TUI rendering."""
+    """Handle one submitted line for either headless or TUI rendering."""       #处理一条已提交的行
     if not bundle.external_api_client:
         bundle.hook_executor.update_registry(
             load_hook_registry(bundle.current_settings(), bundle.current_plugins())
         )
-
+    # 命令解析，检查用户输入是否为斜杠命令。
     parsed = bundle.commands.lookup(line)
     if parsed is not None:
         command, args = parsed
@@ -460,7 +460,7 @@ async def handle_line(
     system_prompt = build_runtime_system_prompt(settings, cwd=bundle.cwd, latest_user_prompt=line)
     bundle.engine.set_system_prompt(system_prompt)
     try:
-        async for event in bundle.engine.submit_message(line):
+        async for event in bundle.engine.submit_message(line):      #请求llm，循环接收返回值
             await render_event(event)
     except MaxTurnsExceeded as exc:
         await print_system(f"Stopped after {exc.max_turns} turns (max_turns).")

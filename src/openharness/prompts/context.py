@@ -37,7 +37,7 @@ def build_runtime_system_prompt(
     cwd: str | Path,
     latest_user_prompt: str | None = None,
 ) -> str:
-    """Build the runtime system prompt with project instructions and memory."""
+    """Build the runtime system prompt with project instructions and memory."""     #根据项目说明和内存情况构建 系统提示。
     sections = [build_system_prompt(custom_prompt=settings.system_prompt, cwd=str(cwd))]
 
     if settings.fast_mode:

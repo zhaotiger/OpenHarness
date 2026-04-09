@@ -39,15 +39,15 @@ class HookRegistry:
 
 def load_hook_registry(settings, plugins=None) -> HookRegistry:
     """Load hooks from the current settings object."""
-    registry = HookRegistry()
-    for raw_event, hooks in settings.hooks.items():
+    registry = HookRegistry()                       # 创建空的注册表
+    for raw_event, hooks in settings.hooks.items():     # 第一步：从配置文件加载 hooks
         try:
-            event = HookEvent(raw_event)
+            event = HookEvent(raw_event)             # 将字符串转换为枚举
         except ValueError:
             continue
         for hook in hooks:
             registry.register(event, hook)
-    for plugin in plugins or []:
+    for plugin in plugins or []:                    # 第二步：从插件加载 hooks
         if not plugin.enabled:
             continue
         for raw_event, hooks in plugin.hooks.items():
@@ -57,4 +57,4 @@ def load_hook_registry(settings, plugins=None) -> HookRegistry:
                 continue
             for hook in hooks:
                 registry.register(event, hook)
-    return registry
+    return registry         # 返回填充好的注册表
