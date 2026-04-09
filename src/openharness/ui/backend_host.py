@@ -56,7 +56,7 @@ class BackendHostConfig:
 
 
 class ReactBackendHost:
-    """Drive the OpenHarness runtime over a structured stdin/stdout protocol."""
+    """Drive the OpenHarness runtime over a structured stdin/stdout protocol."""  # 通过结构化的标准输入/输出协议来驱动 OpenHarness 运行时环境
 
     def __init__(self, config: BackendHostConfig) -> None:
         self._config = config
@@ -86,15 +86,22 @@ class ReactBackendHost:
             enforce_max_turns=self._config.enforce_max_turns,
             session_backend=self._config.session_backend,
         )
+        """
+          执行所有 SESSION_START 钩子
+              ├─ 钩子1: 初始化日志
+              ├─ 钩子2: 加载环境变量
+              ├─ 钩子3: 检查依赖
+              └─ 钩子N: 自定义逻辑
+        """
         await start_runtime(self._bundle)
-        await self._emit(
+        await self._emit(           # 发送 ready 事件
             BackendEvent.ready(
                 self._bundle.app_state.get(),
                 get_task_manager().list_tasks(),
                 [f"/{command.name}" for command in self._bundle.commands.list_commands()],
             )
         )
-        await self._emit(self._status_snapshot())
+        await self._emit(self._status_snapshot())   #发送 state_snapshot 事件
 
         reader = asyncio.create_task(self._read_requests())
         try:

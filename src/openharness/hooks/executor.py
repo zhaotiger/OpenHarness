@@ -62,19 +62,26 @@ class HookExecutor:
             self._context.default_model = default_model
 
     async def execute(self, event: HookEvent, payload: dict[str, Any]) -> AggregatedHookResult:
-        """Execute all matching hooks for an event."""
+        """Execute all matching hooks for an event."""  #执行与该事件相匹配的所有钩子。
         results: list[HookResult] = []
+        # 从注册表获取该事件的所有钩子
         for hook in self._registry.get(event):
             if not _matches_hook(hook, payload):
                 continue
+            # 根据钩子类型执行不同的逻辑
             if isinstance(hook, CommandHookDefinition):
+                # Shell 命令钩子
                 results.append(await self._run_command_hook(hook, event, payload))
             elif isinstance(hook, HttpHookDefinition):
+                # HTTP 请求钩子
                 results.append(await self._run_http_hook(hook, event, payload))
             elif isinstance(hook, PromptHookDefinition):
+                # AI 提示词钩子
                 results.append(await self._run_prompt_like_hook(hook, event, payload, agent_mode=False))
             elif isinstance(hook, AgentHookDefinition):
+                # AI Agent 钩子
                 results.append(await self._run_prompt_like_hook(hook, event, payload, agent_mode=True))
+        #   返回所有钩子的执行结果
         return AggregatedHookResult(results=results)
 
     async def _run_command_hook(

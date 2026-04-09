@@ -268,7 +268,7 @@ async def build_runtime(
 
 
 async def start_runtime(bundle: RuntimeBundle) -> None:
-    """Run session start hooks."""
+    """Run session start hooks."""  #运行会话启动钩子
     await bundle.hook_executor.execute(
         HookEvent.SESSION_START,
         {"cwd": bundle.cwd, "event": HookEvent.SESSION_START.value},
