@@ -392,19 +392,19 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
 
 
 async def handle_line(
-    bundle: RuntimeBundle,
-    line: str,
+    bundle: RuntimeBundle,      #包含整个运行时会话的所有组件（API客户端、引擎、工具注册表等）
+    line: str,                  #用户输入的文本行
     *,
     print_system: SystemPrinter,
     render_event: StreamRenderer,
     clear_output: ClearHandler,
-) -> bool:
-    """Handle one submitted line for either headless or TUI rendering."""       #处理一条已提交的行
+) -> bool:          #返回布尔值，表示是否应该继续会话（False 表示退出）
+    """Handle one submitted line for either headless or TUI rendering."""       #处理用户提交的每一行输入
     if not bundle.external_api_client:
         bundle.hook_executor.update_registry(
             load_hook_registry(bundle.current_settings(), bundle.current_plugins())
         )
-    # 命令解析，检查用户输入是否为斜杠命令。
+    # 如果用户输入是斜杠命令。执行对应的命令处理器
     parsed = bundle.commands.lookup(line)
     if parsed is not None:
         command, args = parsed
@@ -453,14 +453,16 @@ async def handle_line(
             )
         sync_app_state(bundle)
         return not result.should_exit
-
+    # 斜杠命令处理器 end
+    # 获取当前会话的有效配置设置
     settings = bundle.current_settings()
-    if bundle.enforce_max_turns:
+    if bundle.enforce_max_turns:        #轮次限制（防止无限循环）
         bundle.engine.set_max_turns(settings.max_turns)
+    #构建并设置系统提示词
     system_prompt = build_runtime_system_prompt(settings, cwd=bundle.cwd, latest_user_prompt=line)
     bundle.engine.set_system_prompt(system_prompt)
     try:
-        async for event in bundle.engine.submit_message(line):      #请求llm，循环接收返回值
+        async for event in bundle.engine.submit_message(line):      #异步流式处理：请求llm，循环接收返回值
             await render_event(event)
     except MaxTurnsExceeded as exc:
         await print_system(f"Stopped after {exc.max_turns} turns (max_turns).")

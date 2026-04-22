@@ -151,7 +151,7 @@ class ReactBackendHost:
                     continue
                 self._busy = True
                 try:
-                    should_continue = await self._process_line(line)
+                    should_continue = await self._process_line(line)   # 处理发来消息
                 finally:
                     self._busy = False
                 if not should_continue:
@@ -286,7 +286,7 @@ class ReactBackendHost:
                 )
                 return
 
-        async def _clear_output() -> None:
+        async def _clear_output() -> None:          # 清除会话记录（前端清空对话历史） 和打印函数对应
             await self._emit(BackendEvent(type="clear_transcript"))
 
         should_continue = await handle_line(

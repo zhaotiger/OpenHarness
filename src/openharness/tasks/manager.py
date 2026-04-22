@@ -96,7 +96,7 @@ class BackgroundTaskManager:
         return self._tasks.get(task_id)
 
     def list_tasks(self, *, status: TaskStatus | None = None) -> list[TaskRecord]:
-        """Return all tasks, optionally filtered by status."""
+        """Return all tasks, optionally filtered by status.  返回所有任务，可按状态进行筛选（过滤）"""
         tasks = list(self._tasks.values())
         if status is not None:
             tasks = [task for task in tasks if task.status == status]

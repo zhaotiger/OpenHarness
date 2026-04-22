@@ -107,27 +107,32 @@ class QueryEngine:
                 continue
             return bool(msg.tool_uses)
         return False
-
+    # 核心方法
     async def submit_message(self, prompt: str) -> AsyncIterator[StreamEvent]:
-        """Append a user message and execute the query loop."""
+        """Append a user message and execute the query loop. """
+        # 将用户输入转换为 ConversationMessage 对象
+        # 追加到对话历史列表 _messages 中
+        # 这条消息会被发送给 LLM 作为上下文的一部分
         self._messages.append(ConversationMessage.from_user_text(prompt))
+        # 构建查询上下文
         context = QueryContext(
-            api_client=self._api_client,
-            tool_registry=self._tool_registry,
-            permission_checker=self._permission_checker,
-            cwd=self._cwd,
-            model=self._model,
-            system_prompt=self._system_prompt,
-            max_tokens=self._max_tokens,
-            max_turns=self._max_turns,
-            permission_prompt=self._permission_prompt,
-            ask_user_prompt=self._ask_user_prompt,
-            hook_executor=self._hook_executor,
-            tool_metadata=self._tool_metadata,
+            api_client=self._api_client,         # API 客户端（Claude/OpenAI）
+            tool_registry=self._tool_registry,   # 工具注册表（可用的工具）
+            permission_checker=self._permission_checker,    # 权限检查器
+            cwd=self._cwd,                       # 当前工作目录
+            model=self._model,                   # 模型名称
+            system_prompt=self._system_prompt,   # 系统提示词
+            max_tokens=self._max_tokens,         # 最大生成 token 数
+            max_turns=self._max_turns,           # 最大对话轮次
+            permission_prompt=self._permission_prompt, #权限提示回调
+            ask_user_prompt=self._ask_user_prompt,     #用户输入回调
+            hook_executor=self._hook_executor,         # 钩子执行器
+            tool_metadata=self._tool_metadata,         # 工具原数据
         )
+        # 执行查询循环
         async for event, usage in run_query(context, self._messages):
             if usage is not None:
-                self._cost_tracker.add(usage)
+                self._cost_tracker.add(usage)  #累计token使用
             yield event
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:

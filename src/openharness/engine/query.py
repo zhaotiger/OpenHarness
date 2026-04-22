@@ -64,11 +64,11 @@ class QueryContext:
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
 
-
+# 核心查询引擎，实现了完整的工具感知对话循环。
 async def run_query(
-    context: QueryContext,
-    messages: list[ConversationMessage],
-) -> AsyncIterator[tuple[StreamEvent, UsageSnapshot | None]]:
+    context: QueryContext,                      #查询上下文对象
+    messages: list[ConversationMessage],        #对话历史列表
+) -> AsyncIterator[tuple[StreamEvent, UsageSnapshot | None]]:   #返回：异步迭代器，产生 (事件, 使用量) 元组
     """Run the conversation loop until the model stops requesting tools.
 
     Auto-compaction is checked at the start of each turn.  When the
@@ -76,10 +76,10 @@ async def run_query(
     the engine first tries a cheap microcompact (clearing old tool result
     content) and, if that is not enough, performs a full LLM-based
     summarization of older messages.
-    持续进行对话循环，直到模型不再请求使用工具为止。
-    每次回合开始时都会进行自动压缩检查。当......的时候
-    估计的标记数量超过了模型的自动压缩阈值，
-    引擎首先会尝试一种较为简单的微压缩（清除旧的工具结果内容），如果这还不够，就会对较早的消息进行基于大型语言模型的完整摘要处理。
+    运行对话循环，直到模型不再请求调用工具。
+    自动压缩机制会在每一轮对话开始时进行检查。
+    当估算的令牌（token）数量超过模型的自动压缩阈值时，引擎会首先尝试低成本的“微压缩”（即清除旧的工具返回内容）；
+    如果这样做仍不足以释放空间，则会执行基于大语言模型（LLM）的完整摘要，对较早的消息进行总结
     """
     from openharness.services.compact import (
         AutoCompactState,
@@ -91,7 +91,7 @@ async def run_query(
     turn_count = 0
     while context.max_turns is None or turn_count < context.max_turns:
         turn_count += 1
-        # --- auto-compact check before calling the model ---------------
+        # --- auto-compact check before calling the model 在调用模型之前先进行自动压缩检查 ---------------
         messages, was_compacted = await auto_compact_if_needed(
             messages,
             api_client=context.api_client,
@@ -105,6 +105,11 @@ async def run_query(
         usage = UsageSnapshot()
 
         try:
+            """
+            流式接收 LLM 响应
+            实时转发文本增量给用户
+            处理网络错误和重试逻辑
+            """
             async for event in context.api_client.stream_message(
                 ApiMessageRequest(
                     model=context.model,
@@ -114,8 +119,8 @@ async def run_query(
                     tools=context.tool_registry.to_api_schema(),
                 )
             ):
-                if isinstance(event, ApiTextDeltaEvent):
-                    yield AssistantTextDelta(text=event.text), None
+                if isinstance(event, ApiTextDeltaEvent):    #是否为文本增量事件(流式输出)
+                    yield AssistantTextDelta(text=event.text), None   #发送给前端
                     continue
                 if isinstance(event, ApiRetryEvent):
                     yield StatusEvent(
@@ -136,31 +141,33 @@ async def run_query(
             else:
                 yield ErrorEvent(message=f"API error: {error_msg}"), None
             return
-
+        # 处理收到的完整消息
+        # 验证消息返回完整
         if final_message is None:
             raise RuntimeError("Model stream finished without a final message")
-
+        # 将模型返回消息添加到对话历史
         messages.append(final_message)
+        # 通知上层：本轮对话完成
         yield AssistantTurnComplete(message=final_message, usage=usage), usage
-
+        # 检查是否有工具调用
         if not final_message.tool_uses:
-            return
-
+            return  # 没有工具调用 → 结束循环
+        # 如果有工具调用 → 执行工具
         tool_calls = final_message.tool_uses
 
         if len(tool_calls) == 1:
-            # Single tool: sequential (stream events immediately)
+            # 单一工具：顺序模式（立即处理事件）
             tc = tool_calls[0]
-            yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
+            yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None  #UI 显示 "正在执行 Read 工具..."
             result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
-            yield ToolExecutionCompleted(
+            yield ToolExecutionCompleted(       #显示 "Read 工具完成，结果：{...}"
                 tool_name=tc.name,
                 output=result.content,
                 is_error=result.is_error,
             ), None
             tool_results = [result]
         else:
-            # Multiple tools: execute concurrently, emit events after
+            # 多种工具：可同时执行，事件可在之后触发
             for tc in tool_calls:
                 yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
 
@@ -176,7 +183,7 @@ async def run_query(
                     output=result.content,
                     is_error=result.is_error,
                 ), None
-
+        # 将工具结果添加到对话历史
         messages.append(ConversationMessage(role="user", content=tool_results))
 
     if context.max_turns is not None:

@@ -392,7 +392,7 @@ async def compact_conversation(
 
 
 # ---------------------------------------------------------------------------
-# Auto-compact integration (called from query loop)
+# Auto-compact integration (called from query loop) 自动压缩集成（从查询循环中调用）
 # ---------------------------------------------------------------------------
 
 async def auto_compact_if_needed(
@@ -405,11 +405,18 @@ async def auto_compact_if_needed(
     preserve_recent: int = 6,
 ) -> tuple[list[ConversationMessage], bool]:
     """Check if auto-compact should fire, and if so, compact.
-
+    检查自动压缩是否应启动，如果应启动，则执行压缩操作。    
     Call this at the start of each query loop turn.
-
+    在每次查询循环轮次开始时执行此操作。
     Returns:
         (messages, was_compacted) — if compacted, messages is the new list.
+        （消息，是否已压缩）—— 如果已压缩，则 messages 表示新的列表。
+    """
+    """
+    检查消息历史是否超过模型的 token 限制
+    如果超过，先尝试"微压缩"（清除旧工具结果）
+    如果还不够，执行 LLM 摘要压缩
+    避免达到上下文窗口限制
     """
     if not should_autocompact(messages, model, state):
         return messages, False
