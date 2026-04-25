@@ -4,6 +4,9 @@ Runs as a standalone process (``oh cron start``) or can be embedded via
 :func:`run_scheduler_loop`.  Every tick it reads the cron registry, checks
 which enabled jobs are due, executes them, and records results in a history
 log.
+cron 任务调度守护进程。
+它既可以作为一个独立进程运行（即“oh cron start”命令），也可以通过 ：func:`run_scheduler_loop` 函数嵌入其中。
+每次循环时，它都会读取 cron 注册表，检查哪些已启用的任务即将执行，并执行这些任务，同时将结果记录在历史日志中。
 """
 
 from __future__ import annotations
@@ -302,7 +305,7 @@ async def run_scheduler_loop(*, once: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Daemon entry point (spawned by ``oh cron start``)
+# Daemon entry point (spawned by ``oh cron start``) 守护进程入口点（由“oh cron start”命令启动）
 # ---------------------------------------------------------------------------
 
 def _run_daemon() -> None:
