@@ -86,15 +86,15 @@ def build_system_prompt(
     env: EnvironmentInfo | None = None,
     cwd: str | None = None,
 ) -> str:
-    """Build the complete system prompt.
+    """构建完整的系统提示词
 
     Args:
-        custom_prompt: If provided, replaces the base system prompt entirely.
-        env: Pre-built EnvironmentInfo. If None, auto-detects.
-        cwd: Working directory override (only used when env is None).
+        custom_prompt: 如果提供，则完全替换基础系统提示词。
+        env: 预构建的环境信息。如果为 None，则自动检测。
+        cwd: 工作目录覆盖（仅在 env 为 None 时使用）。
 
     Returns:
-        The assembled system prompt string.
+        组装后的系统提示词字符串
     """
     if env is None:
         env = get_environment_info(cwd=cwd)

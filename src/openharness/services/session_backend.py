@@ -12,7 +12,7 @@ from openharness.services import session_storage
 
 
 class SessionBackend(Protocol):
-    """Interface for persisting and restoring session state."""
+    """Interface for persisting and restoring session state. 用于持久化和恢复会话状态的接口"""
 
     def get_session_dir(self, cwd: str | Path) -> Path:
         """Return the backing directory for session files."""
@@ -27,13 +27,13 @@ class SessionBackend(Protocol):
         usage: UsageSnapshot,
         session_id: str | None = None,
     ) -> Path:
-        """Persist a session snapshot and return its path."""
+        """Persist a session snapshot and return its path. 保存会话快照并返回其路径"""
 
     def load_latest(self, cwd: str | Path) -> dict | None:
-        """Load the latest session snapshot."""
+        """Load the latest session snapshot. 加载最新的会话快照"""
 
     def list_snapshots(self, cwd: str | Path, limit: int = 20) -> list[dict]:
-        """List recent snapshots."""
+        """List recent snapshots. 列出最近的快照。"""
 
     def load_by_id(self, cwd: str | Path, session_id: str) -> dict | None:
         """Load a snapshot by ID."""

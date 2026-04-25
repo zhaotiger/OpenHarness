@@ -149,7 +149,7 @@ def plugin_uninstall(
 
 @cron_app.command("start")
 def cron_start() -> None:
-    """Start the cron scheduler daemon."""
+    """Start the cron scheduler daemon. 启动定时任务调度器守护进程。"""
     from openharness.services.cron_scheduler import is_scheduler_running, start_daemon
 
     if is_scheduler_running():
@@ -161,7 +161,7 @@ def cron_start() -> None:
 
 @cron_app.command("stop")
 def cron_stop() -> None:
-    """Stop the cron scheduler daemon."""
+    """Stop the cron scheduler daemon. 停止 cron 调度器守护进程"""
     from openharness.services.cron_scheduler import stop_scheduler
 
     if stop_scheduler():
@@ -184,7 +184,7 @@ def cron_status_cmd() -> None:
 
 @cron_app.command("list")
 def cron_list_cmd() -> None:
-    """List all registered cron jobs with schedule and status."""
+    """List all registered cron jobs with schedule and status. 列出所有已注册的定时任务及其计划和状态。"""
     from openharness.services.cron import load_cron_jobs
 
     jobs = load_cron_jobs()
