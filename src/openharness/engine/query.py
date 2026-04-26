@@ -99,6 +99,7 @@ async def run_query(
             system_prompt=context.system_prompt,
             state=compact_state,
         )
+        print(messages)
         # ---------------------------------------------------------------
 
         final_message: ConversationMessage | None = None
@@ -145,6 +146,7 @@ async def run_query(
         # 验证消息返回完整
         if final_message is None:
             raise RuntimeError("Model stream finished without a final message")
+        print(final_message)
         # 将模型返回消息添加到对话历史
         messages.append(final_message)
         # 通知上层：本轮对话完成
@@ -230,8 +232,8 @@ async def _execute_tool_call(
             is_error=True,
         )
 
-    # Normalize common tool inputs before permission checks so path rules apply
-    # consistently across built-in tools that use either `file_path` or `path`.
+    # Normalize common tool inputs before permission checks so path rules apply 在进行权限检查之前，先对常用工具的输入进行规范化处理，以便路径规则能够生效。
+    # consistently across built-in tools that use either `file_path` or `path`. 在所有使用“文件路径”或“路径”的内置工具中都是如此。
     _file_path = _resolve_permission_file_path(context.cwd, tool_input, parsed_input)
     _command = _extract_permission_command(tool_input, parsed_input)
     log.debug("permission check: %s read_only=%s path=%s cmd=%s",

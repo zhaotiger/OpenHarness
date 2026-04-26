@@ -107,7 +107,7 @@ def wrap_command_for_sandbox(
     *,
     settings: Settings | None = None,
 ) -> tuple[list[str], Path | None]:
-    """Wrap an argv list with ``srt`` when sandboxing is active."""
+    """Wrap an argv list with ``srt`` when sandboxing is active. 当沙盒功能启用时，将 argv 列表用“srt”包裹起来"""
     resolved_settings = settings or load_settings()
     availability = get_sandbox_availability(resolved_settings)
     if not availability.active:
@@ -119,6 +119,7 @@ def wrap_command_for_sandbox(
     # The ``srt`` argv form does not reliably preserve child exit codes for shell-style
     # commands such as ``bash -lc 'exit 1'``. Build a single escaped command string and
     # pass it through ``-c`` so hook/tool failures still propagate correctly.
+    # “srt”参数格式无法可靠地保存诸如“bash -lc 'exit 1'”这类 shell 风格命令的子进程退出代码。构建一个经过转义的命令字符串，并通过“-c”参数传递它，这样钩子/工具出现的故障仍能正确传播。
     wrapped = [
         availability.command or "srt",
         "--settings",
