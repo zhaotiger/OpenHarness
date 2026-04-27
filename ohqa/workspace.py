@@ -1,5 +1,4 @@
 """Workspace helpers for the ohqa personal-agent app."""
-# ohqa 个人应用的工作区管理工具
 
 from __future__ import annotations
 
@@ -7,20 +6,8 @@ import json
 import os
 from pathlib import Path
 
+WORKSPACE_DIRNAME = ".ohqa"
 
-# ========== 工作区配置 ==========
-WORKSPACE_DIRNAME = ".ohqa"  # 工作区目录名称
-
-# ========== 模板文件定义 ==========
-
-# | 模板文件               | 核心改造                          |
-# |-----------------------|---------------------------------|
-# | SOUL_TEMPLATE         | 测试思维、工作边界、技能栈、工作流程   |
-# | USER_TEMPLATE         | 测试风格、环境工具、协作模式、测试痛点  |
-# | IDENTITY_TEMPLATE     | 测试专家形象、"假设一切都会出错"签名   |
-# | MEMORY_INDEX_TEMPLATE | 记忆原则                          |
-
-# AI 助手的"灵魂" - 核心行为准则和价值观
 SOUL_TEMPLATE = """# SOUL.md - 你是谁
 
 你是 ohqa，自动化 Web 测试专家。
@@ -71,7 +58,6 @@ SOUL_TEMPLATE = """# SOUL.md - 你是谁
 - 简单场景简洁描述，复杂测试详细设计
 - 像经验丰富的测试工程师，不是执行脚本的工具人
 - 关注用户视角：这个功能真的好用吗？哪些操作会困惑？
-- 技术选型有依据：为什么用 Playwright 而非 Cypress？为什么测这个接口？
 
 ## 技能栈
 
@@ -106,8 +92,7 @@ SOUL_TEMPLATE = """# SOUL.md - 你是谁
 如果这个文件被实质性修改，告诉用户。这是你的专业灵魂。
 """
 
-# 用户画像模板 - 存储用户信息、偏好和关系定位
-USER_TEMPLATE = """# USER.md - 关于你的伙伴
+USER_TEMPLATE = """# user.md - 关于你的伙伴
 
 了解你服务的测试工程师。保持实用、尊重、及时更新。
 
@@ -162,7 +147,6 @@ ohqa 应该如何与你协作？
 记住：要学得足够好以便能够出色地完成任务，而非为了积累档案材料而盲目学习。
 """
 
-# AI 助手身份标识模板 - 名称、类型、风格等
 IDENTITY_TEMPLATE = """# IDENTITY.md - 你的形象
 
 
@@ -174,7 +158,6 @@ IDENTITY_TEMPLATE = """# IDENTITY.md - 你的形象
 保持简短具体。当你对 ohqa 有了更清晰的认识后，更新此文件。
 """
 
-# 首次运行引导模板 - AI 与用户的初次交互指南
 BOOTSTRAP_TEMPLATE = """# BOOTSTRAP.md - 初次接触
 
 
@@ -213,7 +196,6 @@ BOOTSTRAP_TEMPLATE = """# BOOTSTRAP.md - 初次接触
 如果以后它不在了，不要假设应该把它找回来。
 """
 
-# 记忆索引模板 - 个人记忆文件的索引
 MEMORY_INDEX_TEMPLATE = """# 记忆索引
 
 ## 使用说明
@@ -262,8 +244,6 @@ MEMORY_INDEX_TEMPLATE = """# 记忆索引
 """
 
 
-# ========== 路径获取函数组 ==========
-
 def get_workspace_root(workspace: str | Path | None = None) -> Path:
     """返回 ohqa 工作区根目录
 
@@ -272,7 +252,7 @@ def get_workspace_root(workspace: str | Path | None = None) -> Path:
     2. ohqa_WORKSPACE 环境变量
     3. ~/.ohqa（默认）
     """
-    explicit = workspace or os.environ.get("ohqa_WORKSPACE")
+    explicit = workspace or os.environ.get("OHQA_WORKSPACE")
     if explicit:
         path = Path(explicit).expanduser().resolve()
         return path if path.name == WORKSPACE_DIRNAME else path
@@ -280,67 +260,68 @@ def get_workspace_root(workspace: str | Path | None = None) -> Path:
 
 
 def get_soul_path(workspace: str | Path | None = None) -> Path:
-    """获取 soul.md 文件路径"""
     return get_workspace_root(workspace) / "soul.md"
 
 
 def get_user_path(workspace: str | Path | None = None) -> Path:
-    """获取 user.md 文件路径"""
     return get_workspace_root(workspace) / "user.md"
 
 
 def get_identity_path(workspace: str | Path | None = None) -> Path:
-    """获取 identity.md 文件路径"""
     return get_workspace_root(workspace) / "identity.md"
 
 
 def get_bootstrap_path(workspace: str | Path | None = None) -> Path:
-    """获取 BOOTSTRAP.md 文件路径"""
     return get_workspace_root(workspace) / "BOOTSTRAP.md"
 
 
 def get_memory_dir(workspace: str | Path | None = None) -> Path:
-    """获取 memory 目录路径"""
     return get_workspace_root(workspace) / "memory"
 
 
+def get_skills_dir(workspace: str | Path | None = None) -> Path:
+    return get_workspace_root(workspace) / "skills"
+
+
+def get_plugins_dir(workspace: str | Path | None = None) -> Path:
+    return get_workspace_root(workspace) / "plugins"
+
+
 def get_memory_index_path(workspace: str | Path | None = None) -> Path:
-    """获取 MEMORY.md 索引文件路径"""
     return get_memory_dir(workspace) / "MEMORY.md"
 
 
 def get_sessions_dir(workspace: str | Path | None = None) -> Path:
-    """获取 sessions 目录路径"""
     return get_workspace_root(workspace) / "sessions"
 
 
 def get_logs_dir(workspace: str | Path | None = None) -> Path:
-    """获取 logs 目录路径"""
     return get_workspace_root(workspace) / "logs"
 
 
 def get_attachments_dir(workspace: str | Path | None = None) -> Path:
-    """获取 attachments 目录路径"""
     return get_workspace_root(workspace) / "attachments"
 
 
 def get_state_path(workspace: str | Path | None = None) -> Path:
-    """获取 state.json 文件路径"""
     return get_workspace_root(workspace) / "state.json"
 
 
 def get_gateway_config_path(workspace: str | Path | None = None) -> Path:
-    """获取 gateway.json 文件路径"""
     return get_workspace_root(workspace) / "gateway.json"
 
 
-# ========== 工作区管理函数组 ==========
+def get_gateway_restart_notice_path(workspace: str | Path | None = None) -> Path:
+    return get_workspace_root(workspace) / "gateway-restart-notice.json"
+
 
 def ensure_workspace(workspace: str | Path | None = None) -> Path:
-    """创建工作区目录结构（如果不存在）"""
+    """Create the workspace if needed and return its root."""
     root = get_workspace_root(workspace)
     root.mkdir(parents=True, exist_ok=True)
     get_memory_dir(root).mkdir(parents=True, exist_ok=True)
+    get_skills_dir(root).mkdir(parents=True, exist_ok=True)
+    get_plugins_dir(root).mkdir(parents=True, exist_ok=True)
     get_sessions_dir(root).mkdir(parents=True, exist_ok=True)
     get_logs_dir(root).mkdir(parents=True, exist_ok=True)
     get_attachments_dir(root).mkdir(parents=True, exist_ok=True)
@@ -348,32 +329,17 @@ def ensure_workspace(workspace: str | Path | None = None) -> Path:
 
 
 def initialize_workspace(workspace: str | Path | None = None) -> Path:
-    """初始化工作区并创建模板文件（如果缺失）⭐⭐⭐
-
-    此函数执行以下操作：
-    1. 创建工作区目录结构
-    2. 创建模板文件（soul.md、user.md、identity.md、MEMORY.md）
-    3. 初始化 state.json
-    4. 首次运行时创建 BOOTSTRAP.md
-    5. 创建默认网关配置 gateway.json
-    """
-    # ========== 步骤1：创建目录结构 ==========
+    """Create the workspace and seed template files when missing."""
     root = ensure_workspace(workspace)
-
-    # ========== 步骤2：创建模板文件映射 ==========
     templates = {
         get_soul_path(root): SOUL_TEMPLATE,
         get_user_path(root): USER_TEMPLATE,
         get_memory_index_path(root): MEMORY_INDEX_TEMPLATE,
         get_identity_path(root): IDENTITY_TEMPLATE,
     }
-
-    # ========== 步骤3：写入模板文件（如果不存在） ==========
     for path, content in templates.items():
         if not path.exists():
             path.write_text(content.strip() + "\n", encoding="utf-8")
-
-    # ========== 步骤4：初始化或更新 state.json ==========
     state_path = get_state_path(root)
     state_data = {"app": "ohqa", "workspace": str(root.resolve())}
     if not state_path.exists():
@@ -383,16 +349,12 @@ def initialize_workspace(workspace: str | Path | None = None) -> Path:
             state_data = json.loads(state_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             state_data = {"app": "ohqa", "workspace": str(root.resolve())}
-
-    # ========== 步骤5：首次运行时创建 BOOTSTRAP.md ==========
     bootstrap_path = get_bootstrap_path(root)
     if not state_data.get("bootstrap_seeded"):
         state_data["bootstrap_seeded"] = True
         if not bootstrap_path.exists():
             bootstrap_path.write_text(BOOTSTRAP_TEMPLATE.strip() + "\n", encoding="utf-8")
         state_path.write_text(json.dumps(state_data, indent=2) + "\n", encoding="utf-8")
-
-    # ========== 步骤6：创建默认网关配置 ==========
     gateway_path = get_gateway_config_path(root)
     if not gateway_path.exists():
         gateway_path.write_text(
@@ -405,6 +367,8 @@ def initialize_workspace(workspace: str | Path | None = None) -> Path:
                     "send_tool_hints": True,
                     "permission_mode": "default",
                     "sandbox_enabled": False,
+                    "allow_remote_admin_commands": False,
+                    "allowed_remote_admin_commands": [],
                     "log_level": "INFO",
                     "channel_configs": {},
                 },
@@ -417,7 +381,7 @@ def initialize_workspace(workspace: str | Path | None = None) -> Path:
 
 
 def workspace_health(workspace: str | Path | None = None) -> dict[str, bool]:
-    """检查工作区健康状态 - 返回关键资源是否存在"""
+    """Return presence checks for the key workspace assets."""
     root = get_workspace_root(workspace)
     return {
         "workspace": root.exists(),
@@ -425,6 +389,8 @@ def workspace_health(workspace: str | Path | None = None) -> dict[str, bool]:
         "user": get_user_path(root).exists(),
         "identity": get_identity_path(root).exists(),
         "memory_dir": get_memory_dir(root).exists(),
+        "skills_dir": get_skills_dir(root).exists(),
+        "plugins_dir": get_plugins_dir(root).exists(),
         "memory_index": get_memory_index_path(root).exists(),
         "sessions_dir": get_sessions_dir(root).exists(),
         "gateway_config": get_gateway_config_path(root).exists(),

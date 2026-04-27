@@ -1,8 +1,6 @@
-"""
-“python -m ohqa”命令的模块入口点.
-"""
+"""Module entry point for ``python -m ohqa``."""
 
-from ohmo.cli import app
+from ohqa.cli import app
 
 
 if __name__ == "__main__":
