@@ -4,13 +4,740 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sys
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.2"
+__version__ = "0.1.7"
+
+_PREVIEW_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "bug",
+    "by",
+    "fix",
+    "for",
+    "get",
+    "help",
+    "in",
+    "of",
+    "on",
+    "or",
+    "please",
+    "show",
+    "test",
+    "that",
+    "the",
+    "this",
+    "to",
+    "with",
+}
+
+
+def _safe_short(text: str, *, limit: int = 140) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _schema_argument_preview(tool_schema: dict[str, object]) -> dict[str, object]:
+    input_schema = tool_schema.get("input_schema")
+    if not isinstance(input_schema, dict):
+        return {"required_args": [], "optional_args": []}
+    properties = input_schema.get("properties")
+    if not isinstance(properties, dict):
+        return {"required_args": [], "optional_args": []}
+    required_raw = input_schema.get("required")
+    required = (
+        sorted(str(name) for name in required_raw if isinstance(name, str))
+        if isinstance(required_raw, list)
+        else []
+    )
+    optional = sorted(name for name in properties if name not in required)
+    return {"required_args": required, "optional_args": optional}
+
+
+def _mcp_transport_preview(config: object) -> dict[str, str]:
+    if hasattr(config, "type"):
+        transport = str(getattr(config, "type") or "unknown")
+    elif isinstance(config, dict):
+        transport = str(config.get("type") or "unknown")
+    else:
+        transport = "unknown"
+
+    if transport == "stdio":
+        command = getattr(config, "command", None) if not isinstance(config, dict) else config.get("command")
+        args = getattr(config, "args", None) if not isinstance(config, dict) else config.get("args")
+        rendered_args = " ".join(str(item) for item in args) if isinstance(args, list) and args else ""
+        target = " ".join(part for part in (str(command or "").strip(), rendered_args.strip()) if part).strip()
+        return {"transport": "stdio", "target": target or "configured"}
+    if transport in {"http", "ws"}:
+        url = getattr(config, "url", None) if not isinstance(config, dict) else config.get("url")
+        return {"transport": transport, "target": str(url or "").strip() or "configured"}
+    return {"transport": transport, "target": "configured"}
+
+
+def _validate_mcp_server(name: str, config: object) -> dict[str, object]:
+    preview = _mcp_transport_preview(config)
+    issues: list[str] = []
+    status = "ok"
+    transport = preview["transport"]
+
+    if transport == "stdio":
+        command = getattr(config, "command", None) if not isinstance(config, dict) else config.get("command")
+        raw_cwd = getattr(config, "cwd", None) if not isinstance(config, dict) else config.get("cwd")
+        command_text = str(command or "").strip()
+        if not command_text:
+            issues.append("missing command")
+        elif shutil.which(command_text) is None:
+            issues.append(f"command not found in PATH: {command_text}")
+        if raw_cwd:
+            resolved_cwd = Path(str(raw_cwd)).expanduser()
+            if not resolved_cwd.exists():
+                issues.append(f"cwd does not exist: {resolved_cwd}")
+    elif transport in {"http", "ws"}:
+        raw_url = getattr(config, "url", None) if not isinstance(config, dict) else config.get("url")
+        parsed = urlparse(str(raw_url or "").strip())
+        expected = {"http", "https"} if transport == "http" else {"ws", "wss"}
+        if parsed.scheme not in expected or not parsed.netloc:
+            issues.append(f"invalid {transport} url: {raw_url}")
+
+    if issues:
+        status = "error"
+    return {
+        "name": name,
+        **preview,
+        "status": status,
+        "issues": issues,
+    }
+
+
+def _dry_run_command_behavior(name: str) -> dict[str, str]:
+    read_only = {
+        "help",
+        "version",
+        "status",
+        "context",
+        "cost",
+        "usage",
+        "stats",
+        "hooks",
+        "onboarding",
+        "skills",
+        "mcp",
+        "doctor",
+        "diff",
+        "branch",
+        "privacy-settings",
+        "rate-limit-options",
+        "release-notes",
+        "upgrade",
+        "keybindings",
+        "files",
+    }
+    mutating = {
+        "clear",
+        "compact",
+        "resume",
+        "session",
+        "export",
+        "share",
+        "copy",
+        "tag",
+        "rewind",
+        "init",
+        "bridge",
+        "login",
+        "logout",
+        "feedback",
+        "config",
+        "plugin",
+        "reload-plugins",
+        "permissions",
+        "plan",
+        "fast",
+        "effort",
+        "passes",
+        "turns",
+        "continue",
+        "provider",
+        "model",
+        "theme",
+        "output-style",
+        "vim",
+        "voice",
+        "commit",
+        "issue",
+        "pr_comments",
+        "agents",
+        "subagents",
+        "tasks",
+        "autopilot",
+        "ship",
+        "memory",
+    }
+    if name in read_only:
+        return {
+            "kind": "read_only",
+            "detail": "This slash command mainly inspects current state and should not require a model turn.",
+        }
+    if name in mutating:
+        return {
+            "kind": "stateful",
+            "detail": "This slash command can mutate local state, queue work, or trigger follow-up execution depending on its arguments.",
+        }
+    return {
+        "kind": "unknown",
+        "detail": "This slash command comes from a handler or plugin that dry-run cannot classify precisely.",
+    }
+
+
+def _tokenize_preview_text(text: str) -> list[str]:
+    lowered = text.lower()
+    ascii_tokens = re.findall(r"[a-z0-9_/-]+", lowered)
+    cjk_tokens = [char for char in lowered if "\u4e00" <= char <= "\u9fff"]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for token in [*ascii_tokens, *cjk_tokens]:
+        normalized = token.strip("-_/")
+        if len(normalized) < 2 and normalized not in cjk_tokens:
+            continue
+        if normalized in _PREVIEW_STOPWORDS:
+            continue
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
+    return ordered
+
+
+def _score_candidate_match(prompt: str, *fields: str) -> tuple[int, list[str]]:
+    prompt_lower = prompt.lower()
+    prompt_tokens = _tokenize_preview_text(prompt)
+    haystack = " ".join(field.lower() for field in fields if field).strip()
+    if not haystack:
+        return 0, []
+
+    score = 0
+    reasons: list[str] = []
+    for token in prompt_tokens:
+        if token in haystack:
+            score += max(2, min(len(token), 8))
+            if len(reasons) < 3:
+                reasons.append(token)
+    primary_name = fields[0].lower() if fields and fields[0] else ""
+    if primary_name and primary_name in prompt_lower:
+        score += 10
+        if fields[0] not in reasons:
+            reasons.insert(0, fields[0])
+    return score, reasons[:3]
+
+
+def _candidate_entry(name: str, description: str, *, score: int, reasons: list[str]) -> dict[str, object]:
+    return {
+        "name": name,
+        "description": description,
+        "score": score,
+        "reasons": reasons,
+    }
+
+
+def _recommend_preview_candidates(
+    prompt: str | None,
+    *,
+    skills: list[object],
+    tool_schemas: list[dict[str, object]],
+    command_entries: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    if not prompt:
+        return {"skills": [], "tools": [], "commands": []}
+    stripped = prompt.strip()
+    if not stripped or stripped.startswith("/"):
+        return {"skills": [], "tools": [], "commands": []}
+
+    skill_matches: list[dict[str, object]] = []
+    for skill in skills:
+        score, reasons = _score_candidate_match(
+            stripped,
+            str(getattr(skill, "name", "")),
+            str(getattr(skill, "description", "")),
+            str(getattr(skill, "content", ""))[:800],
+        )
+        if score >= 4:
+            skill_matches.append(
+                _candidate_entry(
+                    str(getattr(skill, "name", "")),
+                    str(getattr(skill, "description", "")),
+                    score=score,
+                    reasons=reasons,
+                )
+            )
+
+    tool_matches: list[dict[str, object]] = []
+    for tool in tool_schemas:
+        optional = ", ".join(str(item) for item in tool.get("optional_args") or [])
+        required = ", ".join(str(item) for item in tool.get("required_args") or [])
+        score, reasons = _score_candidate_match(
+            stripped,
+            str(tool.get("name") or ""),
+            str(tool.get("description") or ""),
+            required,
+            optional,
+        )
+        if score >= 4:
+            tool_matches.append(
+                _candidate_entry(
+                    str(tool.get("name") or ""),
+                    str(tool.get("description") or ""),
+                    score=score,
+                    reasons=reasons,
+                )
+            )
+
+    command_matches: list[dict[str, object]] = []
+    for command in command_entries:
+        score, reasons = _score_candidate_match(
+            stripped,
+            str(command.get("name") or ""),
+            str(command.get("description") or ""),
+            str(command.get("behavior", {}).get("detail") or ""),
+        )
+        if score >= 8:
+            command_matches.append(
+                _candidate_entry(
+                    str(command.get("name") or ""),
+                    str(command.get("description") or ""),
+                    score=score,
+                    reasons=reasons,
+                )
+            )
+
+    skill_matches.sort(key=lambda entry: (-int(entry["score"]), str(entry["name"])))
+    tool_matches.sort(key=lambda entry: (-int(entry["score"]), str(entry["name"])))
+    command_matches.sort(key=lambda entry: (-int(entry["score"]), str(entry["name"])))
+    return {
+        "skills": skill_matches[:5],
+        "tools": tool_matches[:8],
+        "commands": command_matches[:5],
+    }
+
+
+def _evaluate_dry_run_readiness(
+    *,
+    prompt: str | None,
+    entrypoint: dict[str, object],
+    validation: dict[str, object],
+) -> dict[str, object]:
+    level = "ready"
+    reasons: list[str] = []
+    next_actions: list[str] = []
+
+    if entrypoint.get("kind") == "unknown_slash_command":
+        level = "blocked"
+        reasons.append("The prompt starts with '/' but does not match any registered slash command.")
+        next_actions.append("Check the command name and run `oh --dry-run -p \"/help\"` to inspect available slash commands.")
+
+    api_client = validation.get("api_client")
+    if isinstance(api_client, dict) and api_client.get("status") == "error":
+        if entrypoint.get("kind") == "model_prompt":
+            level = "blocked"
+            detail = str(api_client.get("detail") or "").strip()
+            reasons.append(detail or "Runtime client resolution failed for a prompt that would require a model call.")
+            next_actions.append("Fix authentication or provider profile configuration before running this prompt.")
+        elif level != "blocked":
+            level = "warning"
+            reasons.append("Runtime client resolution failed. Interactive commands may still work, but model execution would fail.")
+            next_actions.append("If you expect a model call later, fix authentication or provider profile configuration first.")
+
+    mcp_errors = int(validation.get("mcp_errors") or 0)
+    if mcp_errors > 0 and level != "blocked":
+        level = "warning"
+        reasons.append(f"{mcp_errors} configured MCP server(s) have obvious configuration errors.")
+        next_actions.append("Fix or disable the broken MCP server configuration before relying on MCP-backed tools.")
+
+    auth_status = str(validation.get("auth_status") or "")
+    if auth_status.startswith("missing") and entrypoint.get("kind") in {"interactive_session", "model_prompt"} and level != "blocked":
+        level = "warning"
+        reasons.append("Authentication is missing, so live model execution would not start successfully.")
+        next_actions.append("Run `oh auth login` or configure the active profile credentials before executing.")
+
+    if not prompt and level == "ready":
+        reasons.append("No prompt provided; dry-run only validated the session setup path.")
+        next_actions.append("Provide `-p/--print` for a single prompt preview, or start `oh` normally to enter an interactive session.")
+    elif level == "ready":
+        reasons.append("Resolved configuration, prompt assembly, and static discovery checks all look usable.")
+        if entrypoint.get("kind") == "slash_command":
+            next_actions.append(f"You can run `oh -p \"{prompt}\"` directly.")
+        elif entrypoint.get("kind") == "model_prompt":
+            next_actions.append("You can run this prompt directly with `oh -p '...'` or open the interactive UI with `oh`.")
+        else:
+            next_actions.append("You can run OpenHarness normally with the current configuration.")
+
+    deduped_actions: list[str] = []
+    seen_actions: set[str] = set()
+    for action in next_actions:
+        normalized = action.strip()
+        if not normalized or normalized in seen_actions:
+            continue
+        seen_actions.add(normalized)
+        deduped_actions.append(normalized)
+
+    return {"level": level, "reasons": reasons, "next_actions": deduped_actions}
+
+
+def _build_dry_run_preview(
+    *,
+    prompt: str | None,
+    cwd: str,
+    model: str | None,
+    max_turns: int | None,
+    base_url: str | None,
+    system_prompt: str | None,
+    append_system_prompt: str | None,
+    api_key: str | None,
+    api_format: str | None,
+    permission_mode: str | None,
+) -> dict[str, object]:
+    from openharness.api.provider import auth_status, detect_provider
+    from openharness.commands import create_default_command_registry
+    from openharness.config import get_config_file_path, load_settings
+    from openharness.mcp.config import load_mcp_server_configs
+    from openharness.plugins import load_plugins
+    from openharness.prompts.context import build_runtime_system_prompt
+    from openharness.skills import load_skill_registry
+    from openharness.tools import create_default_tool_registry
+    from openharness.ui.runtime import _resolve_api_client_from_settings
+
+    resolved_cwd = str(Path(cwd).expanduser().resolve())
+    settings = load_settings().merge_cli_overrides(
+        model=model,
+        max_turns=max_turns,
+        base_url=base_url,
+        system_prompt=system_prompt,
+        api_key=api_key,
+        api_format=api_format,
+        permission_mode=permission_mode,
+    )
+    provider = detect_provider(settings)
+    auth = auth_status(settings)
+    profile_name, profile = settings.resolve_profile()
+
+    plugins = load_plugins(settings, resolved_cwd)
+    plugin_commands = [
+        command
+        for plugin in plugins
+        if plugin.enabled
+        for command in plugin.commands
+    ]
+    command_registry = create_default_command_registry(plugin_commands=plugin_commands)
+    command_match = command_registry.lookup(prompt) if prompt else None
+    skill_registry = load_skill_registry(resolved_cwd, settings=settings)
+    skills = skill_registry.list_skills()
+    mcp_servers = load_mcp_server_configs(settings, plugins)
+    tool_registry = create_default_tool_registry()
+    tool_schemas = []
+    for tool_schema in tool_registry.to_api_schema():
+        args_preview = _schema_argument_preview(tool_schema)
+        tool_schemas.append(
+            {
+                "name": str(tool_schema.get("name") or ""),
+                "description": str(tool_schema.get("description") or ""),
+                **args_preview,
+            }
+        )
+
+    client_validation = {"status": "ok", "detail": ""}
+    try:
+        with redirect_stderr(StringIO()):
+            _resolve_api_client_from_settings(settings)
+    except SystemExit:
+        client_validation = {"status": "error", "detail": "runtime client could not be resolved with current auth/config"}
+    except Exception as exc:  # pragma: no cover - defensive diagnostic path
+        client_validation = {"status": "error", "detail": str(exc)}
+
+    preview_prompt = prompt.strip() if prompt else None
+    prompt_seed = preview_prompt
+    if append_system_prompt:
+        appended = append_system_prompt.strip()
+        if appended:
+            existing = settings.system_prompt or ""
+            settings = settings.model_copy(update={"system_prompt": f"{existing}\n\n{appended}".strip()})
+    system_prompt_text = build_runtime_system_prompt(
+        settings,
+        cwd=resolved_cwd,
+        latest_user_prompt=prompt_seed,
+    )
+
+    command_entries = []
+    for command in command_registry.list_commands():
+        behavior = _dry_run_command_behavior(command.name)
+        command_entries.append(
+            {
+                "name": command.name,
+                "description": command.description,
+                "remote_invocable": command.remote_invocable,
+                "remote_admin_opt_in": command.remote_admin_opt_in,
+                "behavior": behavior,
+            }
+        )
+
+    recommendations = _recommend_preview_candidates(
+        preview_prompt,
+        skills=skills,
+        tool_schemas=tool_schemas,
+        command_entries=command_entries,
+    )
+
+    if preview_prompt:
+        if preview_prompt.startswith("/") and command_match is not None:
+            matched_command = command_match[0]
+            behavior = _dry_run_command_behavior(matched_command.name)
+            entrypoint = {
+                "kind": "slash_command",
+                "command": matched_command.name,
+                "args": command_match[1],
+                "description": matched_command.description,
+                "remote_invocable": matched_command.remote_invocable,
+                "remote_admin_opt_in": matched_command.remote_admin_opt_in,
+                "behavior": behavior["kind"],
+                "detail": (
+                    f"Input resolves to /{matched_command.name}. "
+                    f"{behavior['detail']} Dry-run does not execute the command handler."
+                ),
+            }
+        elif preview_prompt.startswith("/") and command_match is None:
+            entrypoint = {
+                "kind": "unknown_slash_command",
+                "detail": "Input starts with / but does not match a registered slash command.",
+            }
+        else:
+            entrypoint = {
+                "kind": "model_prompt",
+                "detail": (
+                    "The first live step would be a model request. "
+                    "Exact tool calls and parameters are decided by the model at runtime."
+                ),
+            }
+    else:
+        entrypoint = {
+            "kind": "interactive_session",
+            "detail": "OpenHarness would start and wait for user input. No model or tool call happens until you submit one.",
+        }
+
+    preview = {
+        "mode": "dry-run",
+        "cwd": resolved_cwd,
+        "config_path": str(get_config_file_path()),
+        "prompt": preview_prompt,
+        "prompt_preview": _safe_short(preview_prompt or "", limit=220) if preview_prompt else "",
+        "settings": {
+            "active_profile": profile_name,
+            "profile_label": profile.label,
+            "provider": provider.name,
+            "api_format": settings.api_format,
+            "model": settings.model,
+            "base_url": settings.base_url or "",
+            "permission_mode": settings.permission.mode.value,
+            "max_turns": settings.max_turns,
+            "effort": settings.effort,
+            "passes": settings.passes,
+        },
+        "validation": {
+            "auth_status": auth,
+            "api_client": client_validation,
+            "system_prompt_chars": len(system_prompt_text),
+            "mcp_validation": "skipped in dry-run (configured only; external servers are not started)",
+        },
+        "entrypoint": entrypoint,
+        "commands": command_entries,
+        "skills": [
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "source": skill.source,
+            }
+            for skill in skills
+        ],
+        "tools": tool_schemas,
+        "recommendations": recommendations,
+        "plugins": [
+            {
+                "name": plugin.manifest.name,
+                "enabled": plugin.enabled,
+                "skills": len(plugin.skills),
+                "commands": len(plugin.commands),
+                "agents": len(plugin.agents),
+                "mcp_servers": len(plugin.mcp_servers),
+            }
+            for plugin in plugins
+        ],
+        "mcp_servers": [
+            _validate_mcp_server(name, config)
+            for name, config in sorted(mcp_servers.items())
+        ],
+        "system_prompt_preview": _safe_short(system_prompt_text, limit=600),
+    }
+    mcp_errors = sum(1 for entry in preview["mcp_servers"] if entry.get("status") == "error")
+    preview["validation"]["mcp_errors"] = mcp_errors
+    preview["readiness"] = _evaluate_dry_run_readiness(
+        prompt=preview_prompt,
+        entrypoint=preview["entrypoint"],
+        validation=preview["validation"],
+    )
+    return preview
+
+
+def _format_dry_run_preview(preview: dict[str, object]) -> str:
+    settings = preview.get("settings") if isinstance(preview.get("settings"), dict) else {}
+    validation = preview.get("validation") if isinstance(preview.get("validation"), dict) else {}
+    entrypoint = preview.get("entrypoint") if isinstance(preview.get("entrypoint"), dict) else {}
+    readiness = preview.get("readiness") if isinstance(preview.get("readiness"), dict) else {}
+    recommendations = preview.get("recommendations") if isinstance(preview.get("recommendations"), dict) else {}
+    plugins = preview.get("plugins") if isinstance(preview.get("plugins"), list) else []
+    skills = preview.get("skills") if isinstance(preview.get("skills"), list) else []
+    commands = preview.get("commands") if isinstance(preview.get("commands"), list) else []
+    tools = preview.get("tools") if isinstance(preview.get("tools"), list) else []
+    mcp_servers = preview.get("mcp_servers") if isinstance(preview.get("mcp_servers"), list) else []
+
+    lines = [
+        "OpenHarness Dry Run",
+        "",
+        "Readiness",
+        f"- level: {readiness.get('level', 'unknown')}",
+    ]
+    readiness_reasons = readiness.get("reasons")
+    if isinstance(readiness_reasons, list):
+        for reason in readiness_reasons[:4]:
+            lines.append(f"- {reason}")
+    readiness_actions = readiness.get("next_actions")
+    if isinstance(readiness_actions, list) and readiness_actions:
+        lines.append("- next actions:")
+        for action in readiness_actions[:4]:
+            lines.append(f"  - {action}")
+    lines.extend(
+        [
+        "",
+        "Execution",
+        f"- cwd: {preview.get('cwd')}",
+        f"- prompt: {preview.get('prompt_preview') or '(none)'}",
+        f"- entrypoint: {entrypoint.get('kind', 'unknown')}",
+        f"- detail: {entrypoint.get('detail', '')}",
+        "",
+        "Resolved Settings",
+        f"- profile: {settings.get('active_profile')} ({settings.get('profile_label')})",
+        f"- provider: {settings.get('provider')}",
+        f"- api_format: {settings.get('api_format')}",
+        f"- model: {settings.get('model')}",
+        f"- base_url: {settings.get('base_url') or '(default)'}",
+        f"- permission_mode: {settings.get('permission_mode')}",
+        f"- max_turns: {settings.get('max_turns')}",
+        f"- effort: {settings.get('effort')} / passes={settings.get('passes')}",
+        "",
+        "Validation",
+        f"- auth: {validation.get('auth_status')}",
+        f"- api client: {validation.get('api_client', {}).get('status', 'unknown')}",
+        f"- system prompt chars: {validation.get('system_prompt_chars')}",
+        f"- mcp: {validation.get('mcp_validation')}",
+        f"- mcp config errors: {validation.get('mcp_errors', 0)}",
+        "",
+        "Discovery",
+        f"- plugins: {len(plugins)}",
+        f"- skills: {len(skills)}",
+        f"- slash commands: {len(commands)}",
+        f"- built-in tools: {len(tools)}",
+        f"- configured mcp servers: {len(mcp_servers)}",
+        ]
+    )
+
+    if mcp_servers:
+        lines.extend(["", "Configured MCP"])
+        for entry in mcp_servers[:8]:
+            status = entry.get("status") or "unknown"
+            suffix = ""
+            issues = entry.get("issues")
+            if isinstance(issues, list) and issues:
+                suffix = f" [{'; '.join(str(item) for item in issues)}]"
+            lines.append(
+                f"- {entry.get('name')}: {entry.get('transport')} -> {entry.get('target')} ({status}){suffix}"
+            )
+        if len(mcp_servers) > 8:
+            lines.append(f"- ... (+{len(mcp_servers) - 8} more)")
+
+    if tools:
+        lines.extend(["", "Available Tools"])
+        for entry in tools[:12]:
+            required = entry.get("required_args") or []
+            optional = entry.get("optional_args") or []
+            signature_parts: list[str] = []
+            if required:
+                signature_parts.append("required: " + ", ".join(required))
+            if optional:
+                signature_parts.append("optional: " + ", ".join(optional[:4]))
+            suffix = f" ({'; '.join(signature_parts)})" if signature_parts else ""
+            lines.append(f"- {entry.get('name')}{suffix}")
+        if len(tools) > 12:
+            lines.append(f"- ... (+{len(tools) - 12} more)")
+
+    if skills:
+        lines.extend(["", "Available Skills"])
+        for entry in skills[:8]:
+            lines.append(f"- {entry.get('name')}: {_safe_short(str(entry.get('description') or ''), limit=100)}")
+        if len(skills) > 8:
+            lines.append(f"- ... (+{len(skills) - 8} more)")
+
+    recommended_skills = recommendations.get("skills") if isinstance(recommendations.get("skills"), list) else []
+    recommended_tools = recommendations.get("tools") if isinstance(recommendations.get("tools"), list) else []
+    recommended_commands = recommendations.get("commands") if isinstance(recommendations.get("commands"), list) else []
+    if recommended_skills or recommended_tools or recommended_commands:
+        lines.extend(["", "Likely Matches"])
+        if recommended_skills:
+            lines.append("- skills:")
+            for entry in recommended_skills[:4]:
+                reasons = ", ".join(str(item) for item in entry.get("reasons") or [])
+                suffix = f" [{reasons}]" if reasons else ""
+                lines.append(f"  - {entry.get('name')} (score={entry.get('score')}){suffix}")
+        if recommended_tools:
+            lines.append("- tools:")
+            for entry in recommended_tools[:6]:
+                reasons = ", ".join(str(item) for item in entry.get("reasons") or [])
+                suffix = f" [{reasons}]" if reasons else ""
+                lines.append(f"  - {entry.get('name')} (score={entry.get('score')}){suffix}")
+        if recommended_commands:
+            lines.append("- slash commands:")
+            for entry in recommended_commands[:4]:
+                reasons = ", ".join(str(item) for item in entry.get("reasons") or [])
+                suffix = f" [{reasons}]" if reasons else ""
+                lines.append(f"  - /{entry.get('name')} (score={entry.get('score')}){suffix}")
+
+    if entrypoint.get("kind") == "slash_command":
+        lines.extend(
+            [
+                "",
+                "Slash Command Detail",
+                f"- command: /{entrypoint.get('command')}",
+                f"- description: {entrypoint.get('description')}",
+                f"- behavior: {entrypoint.get('behavior')}",
+                f"- remote_invocable: {entrypoint.get('remote_invocable')}",
+                f"- remote_admin_opt_in: {entrypoint.get('remote_admin_opt_in')}",
+            ]
+        )
+        args = str(entrypoint.get("args") or "").strip()
+        if args:
+            lines.append(f"- args: {args}")
+
+    preview_text = str(preview.get("system_prompt_preview") or "").strip()
+    if preview_text:
+        lines.extend(["", "System Prompt Preview", preview_text])
+
+    return "\n".join(lines)
 
 
 def _version_callback(value: bool) -> None:
@@ -18,12 +745,12 @@ def _version_callback(value: bool) -> None:
         print(f"openharness {__version__}")
         raise typer.Exit()
 
- # 主应用
+
 app = typer.Typer(
     name="openharness",
     help=(
         "Oh my Harness! An AI-powered coding assistant.\n\n"
-        "Starts an interactive session by default, use -p/--print for non-interactive output."   #默认情况下会启动一个交互式会话，若需非交互式输出，请使用 -p 或 --print 参数。
+        "Starts an interactive session by default, use -p/--print for non-interactive output."
     ),
     add_completion=False,
     rich_markup_mode="rich",
@@ -34,18 +761,20 @@ app = typer.Typer(
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
-# 子命令组
+
 mcp_app = typer.Typer(name="mcp", help="Manage MCP servers")
 plugin_app = typer.Typer(name="plugin", help="Manage plugins")
 auth_app = typer.Typer(name="auth", help="Manage authentication")
 provider_app = typer.Typer(name="provider", help="Manage provider profiles")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
-# 将子命令添加到主应用
+autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
+
 app.add_typer(mcp_app)
 app.add_typer(plugin_app)
 app.add_typer(auth_app)
 app.add_typer(provider_app)
 app.add_typer(cron_app)
+app.add_typer(autopilot_app)
 
 
 # ---- mcp subcommands ----
@@ -67,7 +796,7 @@ def mcp_list() -> None:
         transport = cfg.get("transport", cfg.get("command", "unknown"))
         print(f"  {name}: {transport}")
 
- # 定义命令: openharness mcp add
+
 @mcp_app.command("add")
 def mcp_add(
     name: str = typer.Argument(..., help="Server name"),
@@ -149,7 +878,7 @@ def plugin_uninstall(
 
 @cron_app.command("start")
 def cron_start() -> None:
-    """Start the cron scheduler daemon. 启动定时任务调度器守护进程。"""
+    """Start the cron scheduler daemon."""
     from openharness.services.cron_scheduler import is_scheduler_running, start_daemon
 
     if is_scheduler_running():
@@ -161,7 +890,7 @@ def cron_start() -> None:
 
 @cron_app.command("stop")
 def cron_stop() -> None:
-    """Stop the cron scheduler daemon. 停止 cron 调度器守护进程"""
+    """Stop the cron scheduler daemon."""
     from openharness.services.cron_scheduler import stop_scheduler
 
     if stop_scheduler():
@@ -184,7 +913,7 @@ def cron_status_cmd() -> None:
 
 @cron_app.command("list")
 def cron_list_cmd() -> None:
-    """List all registered cron jobs with schedule and status. 列出所有已注册的定时任务及其计划和状态。"""
+    """List all registered cron jobs with schedule and status."""
     from openharness.services.cron import load_cron_jobs
 
     jobs = load_cron_jobs()
@@ -258,6 +987,232 @@ def cron_logs_cmd(
         print(line)
 
 
+# ---- autopilot subcommands ----
+
+@autopilot_app.command("status")
+def autopilot_status_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Show repo autopilot queue status."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    store = RepoAutopilotStore(cwd)
+    counts = store.stats()
+    print("Autopilot queue status:")
+    for status_name in (
+        "queued",
+        "accepted",
+        "preparing",
+        "running",
+        "verifying",
+        "pr_open",
+        "waiting_ci",
+        "repairing",
+        "completed",
+        "merged",
+        "failed",
+        "rejected",
+        "superseded",
+    ):
+        print(f"  {status_name}: {counts.get(status_name, 0)}")
+    next_card = store.pick_next_card()
+    if next_card is not None:
+        print(f"  next: {next_card.id} {next_card.title} (score={next_card.score})")
+    print(f"  registry: {store.registry_path}")
+    print(f"  journal: {store.journal_path}")
+    print(f"  context: {store.context_path}")
+
+
+@autopilot_app.command("list")
+def autopilot_list_cmd(
+    status: str | None = typer.Argument(None, help="Optional status filter"),
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """List repo autopilot cards."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    store = RepoAutopilotStore(cwd)
+    cards = store.list_cards(status=status) if status else store.list_cards()
+    if not cards:
+        print("No autopilot cards.")
+        return
+    for card in cards[:20]:
+        print(f"{card.id} [{card.status}] score={card.score} {card.title}")
+        print(f"  source={card.source_kind} ref={card.source_ref or '-'}")
+        if card.body:
+            print(f"  {_safe_short(card.body)}")
+
+
+@autopilot_app.command("add")
+def autopilot_add_cmd(
+    source: str = typer.Argument("manual_idea", help="Source kind: idea, ohmo, issue, pr, claude"),
+    title: str = typer.Argument(..., help="Task title"),
+    body: str = typer.Option("", "--body", help="Task body/details"),
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Add one repo autopilot card."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    source_map = {
+        "idea": "manual_idea",
+        "manual": "manual_idea",
+        "manual_idea": "manual_idea",
+        "ohmo": "ohmo_request",
+        "ohmo_request": "ohmo_request",
+        "issue": "github_issue",
+        "github_issue": "github_issue",
+        "pr": "github_pr",
+        "github_pr": "github_pr",
+        "claude": "claude_code_candidate",
+        "claude_code_candidate": "claude_code_candidate",
+    }
+    source_kind = source_map.get(source.lower())
+    if source_kind is None:
+        print(f"Unknown source kind: {source}", file=sys.stderr)
+        raise typer.Exit(1)
+    store = RepoAutopilotStore(cwd)
+    card, created = store.enqueue_card(source_kind=source_kind, title=title, body=body)
+    state = "Queued" if created else "Refreshed"
+    print(f"{state} {card.id} (score={card.score}): {card.title}")
+
+
+@autopilot_app.command("context")
+def autopilot_context_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Print the synthesized active repo context."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    store = RepoAutopilotStore(cwd)
+    print(store.load_active_context())
+
+
+@autopilot_app.command("journal")
+def autopilot_journal_cmd(
+    limit: int = typer.Option(12, "--limit", "-n", help="Number of entries"),
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Print the recent repo autopilot journal."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    store = RepoAutopilotStore(cwd)
+    entries = store.load_journal(limit=limit)
+    if not entries:
+        print("Repo journal is empty.")
+        return
+    for entry in entries:
+        print(f"{entry.kind} {entry.task_id or '-'} {entry.summary}")
+
+
+@autopilot_app.command("scan")
+def autopilot_scan_cmd(
+    target: str = typer.Argument(..., help="issues, prs, claude-code, or all"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Number of items"),
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Scan one or more autopilot intake sources."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    store = RepoAutopilotStore(cwd)
+    if target == "issues":
+        print(f"Scanned {len(store.scan_github_issues(limit=limit))} GitHub issues.")
+        return
+    if target == "prs":
+        print(f"Scanned {len(store.scan_github_prs(limit=limit))} GitHub PRs.")
+        return
+    if target == "claude-code":
+        print(f"Scanned {len(store.scan_claude_code_candidates(limit=limit))} claude-code candidates.")
+        return
+    if target == "all":
+        print(json.dumps(store.scan_all_sources(issue_limit=limit, pr_limit=limit), ensure_ascii=False))
+        return
+    print(f"Unknown scan target: {target}", file=sys.stderr)
+    raise typer.Exit(1)
+
+
+@autopilot_app.command("run-next")
+def autopilot_run_next_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+    model: str | None = typer.Option(None, "--model", help="Override execution model"),
+    max_turns: int | None = typer.Option(None, "--max-turns", help="Override execution max turns"),
+    permission_mode: str | None = typer.Option(None, "--permission-mode", help="Override execution permission mode"),
+) -> None:
+    """Run the highest-priority queued autopilot card end-to-end."""
+    import asyncio
+    from openharness.autopilot import RepoAutopilotStore
+
+    try:
+        result = asyncio.run(
+            RepoAutopilotStore(cwd).run_next(
+                model=model,
+                max_turns=max_turns,
+                permission_mode=permission_mode,
+            )
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+    print(f"{result.card_id} -> {result.status}")
+    print(f"run report: {result.run_report_path}")
+    print(f"verification report: {result.verification_report_path}")
+
+
+@autopilot_app.command("tick")
+def autopilot_tick_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+    model: str | None = typer.Option(None, "--model", help="Override execution model"),
+    max_turns: int | None = typer.Option(None, "--max-turns", help="Override execution max turns"),
+    permission_mode: str | None = typer.Option(None, "--permission-mode", help="Override execution permission mode"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Scan limit for issues/PRs"),
+) -> None:
+    """Scan sources and, if idle, run the next queued autopilot task."""
+    import asyncio
+    from openharness.autopilot import RepoAutopilotStore
+
+    try:
+        result = asyncio.run(
+            RepoAutopilotStore(cwd).tick(
+                model=model,
+                max_turns=max_turns,
+                permission_mode=permission_mode,
+                issue_limit=limit,
+                pr_limit=limit,
+            )
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+    if result is None:
+        print("Autopilot tick completed with no execution.")
+        return
+    print(f"{result.card_id} -> {result.status}")
+    print(f"run report: {result.run_report_path}")
+    print(f"verification report: {result.verification_report_path}")
+
+
+@autopilot_app.command("install-cron")
+def autopilot_install_cron_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+) -> None:
+    """Install default cron jobs for repo autopilot scan/tick."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    names = RepoAutopilotStore(cwd).install_default_cron()
+    print("Installed cron jobs: " + ", ".join(names))
+
+
+@autopilot_app.command("export-dashboard")
+def autopilot_export_dashboard_cmd(
+    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+    output: str | None = typer.Option(None, "--output", help="Dashboard output directory"),
+) -> None:
+    """Export a static autopilot kanban site for GitHub Pages."""
+    from openharness.autopilot import RepoAutopilotStore
+
+    path = RepoAutopilotStore(cwd).export_dashboard(output)
+    print(f"Exported autopilot dashboard: {path}")
+
+
 # ---- auth subcommands ----
 
 # Mapping from provider name to human-readable label for interactive prompts.
@@ -271,6 +1226,8 @@ _PROVIDER_LABELS: dict[str, str] = {
     "bedrock": "AWS Bedrock",
     "vertex": "Google Vertex AI",
     "moonshot": "Moonshot (Kimi)",
+    "gemini": "Google Gemini",
+    "minimax": "MiniMax",
 }
 
 _AUTH_SOURCE_LABELS: dict[str, str] = {
@@ -283,6 +1240,8 @@ _AUTH_SOURCE_LABELS: dict[str, str] = {
     "bedrock_api_key": "Bedrock credentials",
     "vertex_api_key": "Vertex credentials",
     "moonshot_api_key": "Moonshot API key",
+    "gemini_api_key": "Gemini API key",
+    "minimax_api_key": "MiniMax API key",
 }
 
 
@@ -574,7 +1533,7 @@ def _specialize_setup_target(manager, target: str) -> str:
         defaults = {
             "kimi-anthropic": ("Kimi (Anthropic-compatible)", "https://api.moonshot.cn/anthropic", "kimi-k2.5"),
             "glm-anthropic": ("GLM (Anthropic-compatible)", "", "glm-4.5"),
-            "minimax-anthropic": ("MiniMax (Anthropic-compatible)", "", "minimax-m1"),
+            "minimax-anthropic": ("MiniMax (Anthropic-compatible)", "", "MiniMax-M2.7"),
         }
         label, suggested_base_url, suggested_model = defaults[choice]
         base_url = _text_prompt("Base URL", default=suggested_base_url).strip()
@@ -724,7 +1683,7 @@ def _login_provider(provider: str) -> None:
         _bind_external_provider(provider)
         return
 
-    if provider in ("anthropic", "openai", "dashscope", "bedrock", "vertex", "moonshot"):
+    if provider in ("anthropic", "openai", "dashscope", "bedrock", "vertex", "moonshot", "gemini", "minimax"):
         label = _PROVIDER_LABELS.get(provider, provider)
         flow = ApiKeyFlow(provider=provider, prompt_text=f"Enter your {label} API key")
         try:
@@ -806,7 +1765,7 @@ def auth_login(
     """Interactively authenticate with a provider.
 
     Run without arguments to choose a provider from a menu.
-    Supported providers: anthropic, anthropic_claude, openai, openai_codex, copilot, dashscope, bedrock, vertex, moonshot.
+    Supported providers: anthropic, anthropic_claude, openai, openai_codex, copilot, dashscope, bedrock, vertex, moonshot, minimax.
     """
     if provider is None:
         print("Select a provider to authenticate:", flush=True)
@@ -1005,6 +1964,8 @@ def provider_add(
     base_url: str | None = typer.Option(None, "--base-url", help="Optional base URL"),
     credential_slot: str | None = typer.Option(None, "--credential-slot", help="Optional profile-specific credential slot"),
     allowed_models: list[str] | None = typer.Option(None, "--allowed-model", help="Allowed model values for this profile"),
+    context_window_tokens: int | None = typer.Option(None, "--context-window-tokens", help="Optional context window override for auto-compact"),
+    auto_compact_threshold_tokens: int | None = typer.Option(None, "--auto-compact-threshold-tokens", help="Optional explicit auto-compact threshold override"),
 ) -> None:
     """Create a provider profile."""
     from openharness.auth.manager import AuthManager
@@ -1023,6 +1984,8 @@ def provider_add(
             base_url=base_url,
             credential_slot=credential_slot or _default_credential_slot_for_profile(name, auth_source),
             allowed_models=allowed_models or ([model] if credential_slot or _default_credential_slot_for_profile(name, auth_source) else []),
+            context_window_tokens=context_window_tokens,
+            auto_compact_threshold_tokens=auto_compact_threshold_tokens,
         ),
     )
     print(f"Saved provider profile: {name}", flush=True)
@@ -1039,6 +2002,8 @@ def provider_edit(
     base_url: str | None = typer.Option(None, "--base-url", help="Optional base URL"),
     credential_slot: str | None = typer.Option(None, "--credential-slot", help="Optional profile-specific credential slot"),
     allowed_models: list[str] | None = typer.Option(None, "--allowed-model", help="Allowed model values for this profile"),
+    context_window_tokens: int | None = typer.Option(None, "--context-window-tokens", help="Optional context window override for auto-compact"),
+    auto_compact_threshold_tokens: int | None = typer.Option(None, "--auto-compact-threshold-tokens", help="Optional explicit auto-compact threshold override"),
 ) -> None:
     """Edit a provider profile."""
     from openharness.auth.manager import AuthManager
@@ -1056,6 +2021,8 @@ def provider_edit(
             base_url=base_url,
             credential_slot=credential_slot,
             allowed_models=allowed_models,
+            context_window_tokens=context_window_tokens,
+            auto_compact_threshold_tokens=auto_compact_threshold_tokens,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -1079,21 +2046,7 @@ def provider_remove(
     print(f"Removed provider profile: {name}", flush=True)
 
 # ---------------------------------------------------------------------------
-# Main command  默认进入这个方法
-#   调用链路
-#
-#   openharness 命令
-#       ↓
-#   __main__.py: app()
-#       ↓
-#   cli.py: app() (Typer 实例)
-#       ↓
-#   @app.callback() → main()  👈 默认入口点
-#       ↓
-#   根据参数调用：
-#       ├── 有 -p/--print → run_print_mode() (一次性输出)
-#       └── 无参数         → run_repl() (交互式会话)
-
+# Main command
 # ---------------------------------------------------------------------------
 
 @app.callback(invoke_without_command=True)
@@ -1103,7 +2056,7 @@ def main(
         False,
         "--version",
         "-v",
-        help="Show version and exit",           #显示版本并退出
+        help="Show version and exit",
         callback=_version_callback,
         is_eager=True,
     ),
@@ -1112,21 +2065,21 @@ def main(
         False,
         "--continue",
         "-c",
-        help="Continue the most recent conversation in the current directory",  #继续当前目录中的最新对话。
+        help="Continue the most recent conversation in the current directory",
         rich_help_panel="Session",
     ),
     resume: str | None = typer.Option(
         None,
         "--resume",
         "-r",
-        help="Resume a conversation by session ID, or open picker",  #通过会话 ID 恢复对话，或者打开选择器
+        help="Resume a conversation by session ID, or open picker",
         rich_help_panel="Session",
     ),
     name: str | None = typer.Option(
         None,
         "--name",
         "-n",
-        help="Set a display name for this session",  #为本次会话设置一个显示名称
+        help="Set a display name for this session",
         rich_help_panel="Session",
     ),
     # --- Model & Effort ---
@@ -1134,25 +2087,25 @@ def main(
         None,
         "--model",
         "-m",
-        help="Model alias (e.g. 'sonnet', 'opus') or full model ID",    #模型别名（例如“sonnet”、“opus”）或完整模型标识符
+        help="Model alias (e.g. 'sonnet', 'opus') or full model ID",
         rich_help_panel="Model & Effort",
     ),
     effort: str | None = typer.Option(
         None,
         "--effort",
-        help="Effort level for the session (low, medium, high, max)",   #本次会话的努力程度（低、中、高、最高）
+        help="Effort level for the session (low, medium, high, max)",
         rich_help_panel="Model & Effort",
     ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
-        help="Override verbose mode setting from config",       #覆盖配置文件中的详细模式设置
+        help="Override verbose mode setting from config",
         rich_help_panel="Model & Effort",
     ),
     max_turns: int | None = typer.Option(
         None,
         "--max-turns",
-        help="Maximum number of agentic turns (enforced by default in --print; optional cap for interactive mode)",     #代理操作的最大轮数（默认情况下在 --print 模式中强制执行；在交互模式中可选地设置上限）
+        help="Maximum number of agentic turns (enforced by default in --print; optional cap for interactive mode)",
         rich_help_panel="Model & Effort",
     ),
     # --- Output ---
@@ -1160,38 +2113,44 @@ def main(
         None,
         "--print",
         "-p",
-        help="Print response and exit. Pass your prompt as the value: -p 'your prompt'",        #打印响应并退出。将提示信息作为值传递：-p '您的提示信息'
+        help="Print response and exit. Pass your prompt as the value: -p 'your prompt'",
         rich_help_panel="Output",
     ),
     output_format: str | None = typer.Option(
         None,
         "--output-format",
-        help="Output format with --print: text (default), json, or stream-json",    #使用“--print”选项时的输出格式：文本（默认）、JSON 或流式 JSON
+        help="Output format with --print: text (default), json, or stream-json",
+        rich_help_panel="Output",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview resolved runtime config, skills, commands, and tools without executing the model or tools",
         rich_help_panel="Output",
     ),
     # --- Permissions ---
     permission_mode: str | None = typer.Option(
         None,
         "--permission-mode",
-        help="Permission mode: default, plan, or full_auto",    #权限模式：默认、计划或全自动
+        help="Permission mode: default, plan, or full_auto",
         rich_help_panel="Permissions",
     ),
     dangerously_skip_permissions: bool = typer.Option(
         False,
         "--dangerously-skip-permissions",
-        help="Bypass all permission checks (only for sandboxed environments)",  #跳过所有权限检查（仅适用于沙盒环境）
+        help="Bypass all permission checks (only for sandboxed environments)",
         rich_help_panel="Permissions",
     ),
     allowed_tools: Optional[list[str]] = typer.Option(
         None,
         "--allowed-tools",
-        help="Comma or space-separated list of tool names to allow",        #以逗号或空格分隔的工具名称列表，用于启用该功能。
+        help="Comma or space-separated list of tool names to allow",
         rich_help_panel="Permissions",
     ),
     disallowed_tools: Optional[list[str]] = typer.Option(
         None,
         "--disallowed-tools",
-        help="Comma or space-separated list of tool names to deny",     #以逗号或空格分隔的要拒绝使用的工具名称列表
+        help="Comma or space-separated list of tool names to deny",
         rich_help_panel="Permissions",
     ),
     # --- System & Context ---
@@ -1199,19 +2158,19 @@ def main(
         None,
         "--system-prompt",
         "-s",
-        help="Override the default system prompt",      #覆盖默认的系统提示信息
+        help="Override the default system prompt",
         rich_help_panel="System & Context",
     ),
     append_system_prompt: str | None = typer.Option(
         None,
         "--append-system-prompt",
-        help="Append text to the default system prompt",    #将附加文本添加到默认系统提示中
+        help="Append text to the default system prompt",
         rich_help_panel="System & Context",
     ),
     settings_file: str | None = typer.Option(
         None,
         "--settings",
-        help="Path to a JSON settings file or inline JSON string",  #指向 JSON 设置文件的路径或嵌入式的 JSON 字符串
+        help="Path to a JSON settings file or inline JSON string",
         rich_help_panel="System & Context",
     ),
     base_url: str | None = typer.Option(
@@ -1230,7 +2189,7 @@ def main(
     bare: bool = typer.Option(
         False,
         "--bare",
-        help="Minimal mode: skip hooks, plugins, MCP, and auto-discovery",  #最小模式：跳过钩子、插件、MCP 以及自动发现功能
+        help="Minimal mode: skip hooks, plugins, MCP, and auto-discovery",
         rich_help_panel="System & Context",
     ),
     api_format: str | None = typer.Option(
@@ -1242,7 +2201,7 @@ def main(
     theme: str | None = typer.Option(
         None,
         "--theme",
-        help="TUI theme: default, dark, minimal, cyberpunk, solarized, or custom name",     #TUI 主题：默认、暗黑、极简、赛博朋克、太阳化、或自定义名称
+        help="TUI theme: default, dark, minimal, cyberpunk, solarized, or custom name",
         rich_help_panel="System & Context",
     ),
     # --- Advanced ---
@@ -1250,29 +2209,35 @@ def main(
         False,
         "--debug",
         "-d",
-        help="Enable debug logging",        #启用调试日志记录
+        help="Enable debug logging",
         rich_help_panel="Advanced",
     ),
     mcp_config: Optional[list[str]] = typer.Option(
         None,
         "--mcp-config",
-        help="Load MCP servers from JSON files or strings",     #从 JSON 文件或字符串中加载 MCP 服务器
+        help="Load MCP servers from JSON files or strings",
         rich_help_panel="Advanced",
     ),
     cwd: str = typer.Option(
         str(Path.cwd()),
         "--cwd",
-        help="Working directory for the session",       #本次会话的工作目录
+        help="Working directory for the session",
         hidden=True,
     ),
     backend_only: bool = typer.Option(
         False,
         "--backend-only",
-        help="Run the structured backend host for the React terminal UI",  #启动专门的后端服务器模式
+        help="Run the structured backend host for the React terminal UI",
+        hidden=True,
+    ),
+    task_worker: bool = typer.Option(
+        False,
+        "--task-worker",
+        help="Run the stdin-driven headless worker loop used for background agent tasks",
         hidden=True,
     ),
 ) -> None:
-    """Start an interactive session or run a single prompt."""  #启动交互式会话或运行单个提示。
+    """Start an interactive session or run a single prompt."""
     if ctx.invoked_subcommand is not None:
         return
 
@@ -1301,7 +2266,43 @@ def main(
         settings.theme = theme
         save_settings(settings)
 
-    from openharness.ui.app import run_print_mode, run_repl
+    from openharness.ui.app import run_print_mode, run_repl, run_task_worker
+
+    if dry_run and (continue_session or resume is not None):
+        print("Error: --dry-run does not support --continue/--resume yet.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if dry_run:
+        prompt = print_mode.strip() if print_mode is not None else None
+        if print_mode is not None and not prompt:
+            print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
+            raise typer.Exit(1)
+        preview = _build_dry_run_preview(
+            prompt=prompt,
+            cwd=cwd,
+            model=model,
+            max_turns=max_turns,
+            base_url=base_url,
+            system_prompt=system_prompt,
+            append_system_prompt=append_system_prompt,
+            api_key=api_key,
+            api_format=api_format,
+            permission_mode=permission_mode,
+        )
+        effective_output_format = output_format or "text"
+        if effective_output_format == "text":
+            print(_format_dry_run_preview(preview))
+        elif effective_output_format == "json":
+            print(json.dumps(preview, ensure_ascii=False, indent=2))
+        elif effective_output_format == "stream-json":
+            print(json.dumps(preview, ensure_ascii=False))
+        else:
+            print(
+                "Error: --dry-run only supports --output-format text, json, or stream-json",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        return
 
     # Handle --continue and --resume flags
     if continue_session or resume is not None:
@@ -1354,9 +2355,12 @@ def main(
                 model=session_data.get("model") or model,
                 backend_only=backend_only,
                 base_url=base_url,
-                system_prompt=session_data.get("system_prompt") or system_prompt,
+                system_prompt=system_prompt,
                 api_key=api_key,
                 restore_messages=session_data.get("messages"),
+                restore_tool_metadata=session_data.get("tool_metadata"),
+                permission_mode=permission_mode,
+                api_format=api_format,
             )
         )
         return
@@ -1383,6 +2387,21 @@ def main(
         )
         return
 
+    if task_worker:
+        asyncio.run(
+            run_task_worker(
+                cwd=cwd,
+                model=model,
+                max_turns=max_turns,
+                base_url=base_url,
+                system_prompt=system_prompt,
+                api_key=api_key,
+                api_format=api_format,
+                permission_mode=permission_mode,
+            )
+        )
+        return
+
     asyncio.run(
         run_repl(
             prompt=None,
@@ -1394,5 +2413,6 @@ def main(
             system_prompt=system_prompt,
             api_key=api_key,
             api_format=api_format,
+            permission_mode=permission_mode,
         )
     )

@@ -109,6 +109,8 @@ def wrap_command_for_sandbox(
 ) -> tuple[list[str], Path | None]:
     """Wrap an argv list with ``srt`` when sandboxing is active. 当沙盒功能启用时，将 argv 列表用“srt”包裹起来"""
     resolved_settings = settings or load_settings()
+    if resolved_settings.sandbox.backend == "docker":
+        return command, None
     availability = get_sandbox_availability(resolved_settings)
     if not availability.active:
         if resolved_settings.sandbox.enabled and resolved_settings.sandbox.fail_if_unavailable:

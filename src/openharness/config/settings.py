@@ -1,16 +1,17 @@
-"""OpenHarness 的设置模型和加载逻辑。
+"""Settings model and loading logic for OpenHarness.
 
-设置按以下优先级解析（从高到低）：
-1. CLI 参数
-2. 环境变量（ANTHROPIC_API_KEY、OPENHARNESS_MODEL 等）
-3. 配置文件（~/.openharness/settings.json）
-4. 默认值
+Settings are resolved with the following precedence (highest first):
+1. CLI arguments
+2. Environment variables (ANTHROPIC_API_KEY, OPENHARNESS_MODEL, etc.)
+3. Config file (~/.openharness/settings.json)
+4. Defaults
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,10 +21,27 @@ from pydantic import BaseModel, Field
 from openharness.hooks.schemas import HookDefinition
 from openharness.mcp.types import McpServerConfig
 from openharness.permissions.modes import PermissionMode
+from openharness.utils.file_lock import exclusive_file_lock
+from openharness.utils.fs import atomic_write_text
+
+
+# ANSI escape sequence pattern
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi_escape_sequences(text: str) -> str:
+    """Remove ANSI escape sequences from text.
+
+    This is used to clean environment variables that may contain terminal
+    formatting codes (e.g., '[1m' for bold) which can corrupt API requests.
+    """
+    if not text:
+        return text
+    return _ANSI_ESCAPE_PATTERN.sub("", text)
 
 
 class PathRuleConfig(BaseModel):
-    """A glob-pattern path permission rule.  路径访问规则。"""
+    """A glob-pattern path permission rule."""
 
     pattern: str
     allow: bool = True
@@ -33,10 +51,10 @@ class PermissionSettings(BaseModel):
     """Permission mode configuration."""
 
     mode: PermissionMode = PermissionMode.DEFAULT
-    allowed_tools: list[str] = Field(default_factory=list) #允许的工具白名单
-    denied_tools: list[str] = Field(default_factory=list)  #禁止的工具黑名单
-    path_rules: list[PathRuleConfig] = Field(default_factory=list) #路径访问规则
-    denied_commands: list[str] = Field(default_factory=list)  # 禁止的命令列表
+    allowed_tools: list[str] = Field(default_factory=list)
+    denied_tools: list[str] = Field(default_factory=list)
+    path_rules: list[PathRuleConfig] = Field(default_factory=list)
+    denied_commands: list[str] = Field(default_factory=list)
 
 
 class MemorySettings(BaseModel):
@@ -45,6 +63,8 @@ class MemorySettings(BaseModel):
     enabled: bool = True
     max_files: int = 5
     max_entrypoint_lines: int = 200
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
 
 
 class SandboxNetworkSettings(BaseModel):
@@ -63,28 +83,43 @@ class SandboxFilesystemSettings(BaseModel):
     deny_write: list[str] = Field(default_factory=list)
 
 
+class DockerSandboxSettings(BaseModel):
+    """Docker-specific sandbox configuration."""
+
+    image: str = "openharness-sandbox:latest"
+    auto_build_image: bool = True
+    cpu_limit: float = 0.0
+    memory_limit: str = ""
+    extra_mounts: list[str] = Field(default_factory=list)
+    extra_env: dict[str, str] = Field(default_factory=dict)
+
+
 class SandboxSettings(BaseModel):
     """Sandbox-runtime integration settings."""
 
     enabled: bool = False
+    backend: str = "srt"
     fail_if_unavailable: bool = False
     enabled_platforms: list[str] = Field(default_factory=list)
     network: SandboxNetworkSettings = Field(default_factory=SandboxNetworkSettings)
     filesystem: SandboxFilesystemSettings = Field(default_factory=SandboxFilesystemSettings)
+    docker: DockerSandboxSettings = Field(default_factory=DockerSandboxSettings)
 
 
 class ProviderProfile(BaseModel):
     """Named provider workflow configuration."""
 
-    label: str                              # 显示名称（如 "Anthropic-Compatible API"）
-    provider: str                           # 提供商类型（如 "anthropic", "openai"）
-    api_format: str                         # API 格式（如 "anthropic", "openai"）
-    auth_source: str                        # 认证方式（如 API Key、OAuth）
-    default_model: str                      # 默认模型（如 "claude-sonnet-4-6"）
-    base_url: str | None = None             # API 端点 URL（可选）
-    last_model: str | None = None           # 用户上次使用的模型
-    credential_slot: str | None = None      # 凭据存储槽位
-    allowed_models: list[str] = Field(default_factory=list)   # 允许使用的模型列表
+    label: str
+    provider: str
+    api_format: str
+    auth_source: str
+    default_model: str
+    base_url: str | None = None
+    last_model: str | None = None
+    credential_slot: str | None = None
+    allowed_models: list[str] = Field(default_factory=list)
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
 
     @property
     def resolved_model(self) -> str:
@@ -187,6 +222,23 @@ def default_provider_profiles() -> dict[str, ProviderProfile]:
             api_format="openai",
             auth_source="moonshot_api_key",
             default_model="kimi-k2.5",
+            base_url="https://api.moonshot.cn/v1",
+        ),
+        "gemini": ProviderProfile(
+            label="Google Gemini",
+            provider="gemini",
+            api_format="openai",
+            auth_source="gemini_api_key",
+            default_model="gemini-2.5-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+        "minimax": ProviderProfile(
+            label="MiniMax",
+            provider="minimax",
+            api_format="openai",
+            auth_source="minimax_api_key",
+            default_model="MiniMax-M2.7",
+            base_url="https://api.minimax.io/v1",
         ),
     }
 
@@ -274,6 +326,8 @@ def auth_source_provider_name(auth_source: str) -> str:
         "bedrock_api_key": "bedrock",
         "vertex_api_key": "vertex",
         "moonshot_api_key": "moonshot",
+        "gemini_api_key": "gemini",
+        "minimax_api_key": "minimax",
     }
     return mapping.get(auth_source, auth_source)
 
@@ -311,6 +365,10 @@ def default_auth_source_for_provider(provider: str, api_format: str | None = Non
         return "vertex_api_key"
     if provider == "moonshot":
         return "moonshot_api_key"
+    if provider == "gemini":
+        return "gemini_api_key"
+    if provider == "minimax":
+        return "minimax_api_key"
     if provider == "openai" or api_format == "openai":
         return "openai_api_key"
     return "anthropic_api_key"
@@ -387,6 +445,9 @@ class Settings(BaseModel):
     model: str = "claude-sonnet-4-6"
     max_tokens: int = 16384
     base_url: str | None = None
+    timeout: float = 30.0
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
     api_format: str = "anthropic"  # "anthropic", "openai", or "copilot"
     provider: str = ""
     active_profile: str = "claude-api"
@@ -400,6 +461,7 @@ class Settings(BaseModel):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)
+    allow_project_plugins: bool = False
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
 
     # UI
@@ -413,34 +475,22 @@ class Settings(BaseModel):
     verbose: bool = False
 
     def merged_profiles(self) -> dict[str, ProviderProfile]:
-        """Return the saved profiles merged over the built-in catalog.
-
-        返回用户保存的配置文件与内置目录合并后的结果。
-        用户的自定义配置会覆盖内置的默认配置。
-        """
-        # 1. 获取内置的 provider profiles 目录（默认配置）
+        """Return the saved profiles merged over the built-in catalog."""
         merged = default_provider_profiles()
-
-        # 2. 用用户保存的 profiles 更新内置目录
-        merged.update(
-            {
-                name: (
-                    # 如果已经是 ProviderProfile 实例，使用深度拷贝避免修改原对象
-                    profile.model_copy(deep=True)
-                    if isinstance(profile, ProviderProfile)
-                    # 如果是字典（从 JSON 加载的），验证并转换为 ProviderProfile
-                    else ProviderProfile.model_validate(profile)
-                )
-                for name, profile in self.profiles.items()
-            }
-        )
+        for name, raw_profile in self.profiles.items():
+            profile = (
+                raw_profile.model_copy(deep=True)
+                if isinstance(raw_profile, ProviderProfile)
+                else ProviderProfile.model_validate(raw_profile)
+            )
+            builtin = merged.get(name)
+            if builtin is not None and profile.base_url is None and builtin.base_url is not None:
+                profile = profile.model_copy(update={"base_url": builtin.base_url})
+            merged[name] = profile
         return merged
 
     def resolve_profile(self, name: str | None = None) -> tuple[str, ProviderProfile]:
-        """
-        Return the active provider profile.
-        返回当前有效的提供商配置文件
-        """
+        """Return the active provider profile."""
         profiles = self.merged_profiles()
         profile_name = (name or self.active_profile or "").strip() or "claude-api"
         if profile_name not in profiles:
@@ -450,10 +500,7 @@ class Settings(BaseModel):
         return profile_name, profiles[profile_name].model_copy(deep=True)
 
     def materialize_active_profile(self) -> Settings:
-        """
-        Project the active profile back onto legacy flat settings fields.
-        将当前配置映射回传统的扁平设置字段。
-        """
+        """Project the active profile back onto legacy flat settings fields."""
         profile_name, profile = self.resolve_profile()
         configured_model = (profile.last_model or "").strip() or profile.default_model
         return self.model_copy(
@@ -463,6 +510,8 @@ class Settings(BaseModel):
                 "provider": profile.provider,
                 "api_format": profile.api_format,
                 "base_url": profile.base_url,
+                "context_window_tokens": profile.context_window_tokens,
+                "auto_compact_threshold_tokens": profile.auto_compact_threshold_tokens,
                 "model": resolve_model_setting(
                     configured_model,
                     profile.provider,
@@ -478,15 +527,21 @@ class Settings(BaseModel):
         This preserves compatibility for callers that still construct `Settings`
         by setting top-level `provider` / `api_format` / `base_url` / `model`
         directly before the profile layer is used everywhere.
-
-        将旧的扁平 provider 字段折叠回活跃配置文件。
-        这保持了与仍然通过直接设置顶层 `provider` / `api_format` / `base_url` / `model`
-        来构造 `Settings` 的调用者的兼容性，在 profile 层被全面使用之前。
         """
         profile_name, profile = self.resolve_profile()
         next_provider = (self.provider or "").strip() or profile.provider
         next_api_format = (self.api_format or "").strip() or profile.api_format
         next_base_url = self.base_url if self.base_url is not None else profile.base_url
+        next_context_window_tokens = (
+            self.context_window_tokens
+            if self.context_window_tokens is not None
+            else profile.context_window_tokens
+        )
+        next_auto_compact_threshold_tokens = (
+            self.auto_compact_threshold_tokens
+            if self.auto_compact_threshold_tokens is not None
+            else profile.auto_compact_threshold_tokens
+        )
         flat_model = (self.model or "").strip()
         resolved_profile_model = resolve_model_setting(
             (profile.last_model or "").strip() or profile.default_model,
@@ -510,6 +565,8 @@ class Settings(BaseModel):
                 "base_url": next_base_url,
                 "auth_source": next_auth_source,
                 "last_model": next_model,
+                "context_window_tokens": next_context_window_tokens,
+                "auto_compact_threshold_tokens": next_auto_compact_threshold_tokens,
             }
         )
         profiles = self.merged_profiles()
@@ -629,6 +686,7 @@ class Settings(BaseModel):
             "openai_api_key": "OPENAI_API_KEY",
             "dashscope_api_key": "DASHSCOPE_API_KEY",
             "moonshot_api_key": "MOONSHOT_API_KEY",
+            "minimax_api_key": "MINIMAX_API_KEY",
         }.get(auth_source)
         if env_var:
             env_value = os.environ.get(env_var, "")
@@ -669,37 +727,84 @@ class Settings(BaseModel):
     def merge_cli_overrides(self, **overrides: Any) -> Settings:
         """Return a new Settings with CLI overrides applied (non-None values only)."""
         updates = {k: v for k, v in overrides.items() if v is not None}
+        # Strip ANSI escape sequences from model name if present
+        if "model" in updates and isinstance(updates["model"], str):
+            updates["model"] = strip_ansi_escape_sequences(updates["model"])
         merged = self.model_copy(update=updates)
         if not updates:
             return merged
-        profile_keys = {"model", "base_url", "api_format", "provider", "api_key", "active_profile", "profiles"}
-        if profile_keys.isdisjoint(updates):
+        profile_keys = {
+            "model",
+            "base_url",
+            "api_format",
+            "provider",
+            "api_key",
+            "active_profile",
+            "profiles",
+            "context_window_tokens",
+            "auto_compact_threshold_tokens",
+        }
+        profile_updates = profile_keys.intersection(updates)
+        if not profile_updates:
             return merged
+        if profile_updates.issubset({"active_profile"}):
+            return merged.materialize_active_profile()
         return merged.sync_active_profile_from_flat_fields().materialize_active_profile()
 
 
 def _apply_env_overrides(settings: Settings) -> Settings:
-    """Apply supported environment variable overrides over loaded settings."""
-    updates: dict[str, Any] = {}
-    model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("OPENHARNESS_MODEL")
-    if model:
-        updates["model"] = model
+    """Apply supported environment variable overrides over loaded settings.
 
-    base_url = (
-        os.environ.get("ANTHROPIC_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENHARNESS_BASE_URL")
-    )
-    if base_url:
-        updates["base_url"] = base_url
+    Provider-scoped env vars (``ANTHROPIC_BASE_URL``, ``ANTHROPIC_MODEL``,
+    ``OPENAI_BASE_URL``) only apply when the active profile does *not*
+    explicitly configure the corresponding field.  ``OPENHARNESS_*`` env vars
+    always override (explicit user intent).
+    """
+    updates: dict[str, Any] = {}
+
+    # Resolve the active profile to check for explicit settings.
+    _, active_profile = settings.resolve_profile()
+    profile_has_base_url = active_profile.base_url is not None
+    profile_explicit_model = (active_profile.last_model or "").strip()
+    profile_has_explicit_model = bool(profile_explicit_model) and profile_explicit_model.lower() not in {"", "default"}
+
+    # --- model ---
+    openharness_model = os.environ.get("OPENHARNESS_MODEL")
+    if openharness_model:
+        updates["model"] = strip_ansi_escape_sequences(openharness_model)
+    elif not profile_has_explicit_model:
+        anthropic_model = os.environ.get("ANTHROPIC_MODEL")
+        if anthropic_model:
+            updates["model"] = strip_ansi_escape_sequences(anthropic_model)
+
+    # --- base_url ---
+    openharness_base = os.environ.get("OPENHARNESS_BASE_URL")
+    if openharness_base:
+        updates["base_url"] = openharness_base
+    elif not profile_has_base_url:
+        generic_base = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+        if generic_base:
+            updates["base_url"] = generic_base
 
     max_tokens = os.environ.get("OPENHARNESS_MAX_TOKENS")
     if max_tokens:
         updates["max_tokens"] = int(max_tokens)
 
+    timeout = os.environ.get("OPENHARNESS_TIMEOUT")
+    if timeout:
+        updates["timeout"] = float(timeout)
+
     max_turns = os.environ.get("OPENHARNESS_MAX_TURNS")
     if max_turns:
         updates["max_turns"] = int(max_turns)
+
+    context_window_tokens = os.environ.get("OPENHARNESS_CONTEXT_WINDOW_TOKENS")
+    if context_window_tokens:
+        updates["context_window_tokens"] = int(context_window_tokens)
+
+    auto_compact_threshold_tokens = os.environ.get("OPENHARNESS_AUTO_COMPACT_THRESHOLD_TOKENS")
+    if auto_compact_threshold_tokens:
+        updates["auto_compact_threshold_tokens"] = int(auto_compact_threshold_tokens)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if api_key:
@@ -715,11 +820,19 @@ def _apply_env_overrides(settings: Settings) -> Settings:
 
     sandbox_enabled = os.environ.get("OPENHARNESS_SANDBOX_ENABLED")
     sandbox_fail = os.environ.get("OPENHARNESS_SANDBOX_FAIL_IF_UNAVAILABLE")
+    sandbox_backend = os.environ.get("OPENHARNESS_SANDBOX_BACKEND")
+    sandbox_docker_image = os.environ.get("OPENHARNESS_SANDBOX_DOCKER_IMAGE")
     sandbox_updates: dict[str, Any] = {}
     if sandbox_enabled is not None:
         sandbox_updates["enabled"] = _parse_bool_env(sandbox_enabled)
     if sandbox_fail is not None:
         sandbox_updates["fail_if_unavailable"] = _parse_bool_env(sandbox_fail)
+    if sandbox_backend is not None:
+        sandbox_updates["backend"] = sandbox_backend
+    if sandbox_docker_image is not None:
+        sandbox_updates["docker"] = settings.sandbox.docker.model_copy(
+            update={"image": sandbox_docker_image}
+        )
     if sandbox_updates:
         updates["sandbox"] = settings.sandbox.model_copy(update=sandbox_updates)
 
@@ -766,11 +879,11 @@ def load_settings(config_path: Path | None = None) -> Settings:
 
 
 def save_settings(settings: Settings, config_path: Path | None = None) -> None:
-    """Persist settings to the config file. 将设置保存至配置文件中。
+    """Persist settings to the config file.
 
     Args:
-        settings: Settings instance to save. 要保存的设置实例。
-        config_path: Path to write. If None, uses the default location. 写入路径。若为无，则使用默认位置。
+        settings: Settings instance to save.
+        config_path: Path to write. If None, uses the default location.
     """
     if config_path is None:
         from openharness.config.paths import get_config_file_path
@@ -778,8 +891,9 @@ def save_settings(settings: Settings, config_path: Path | None = None) -> None:
         config_path = get_config_file_path()
 
     settings = settings.sync_active_profile_from_flat_fields().materialize_active_profile()
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
-        settings.model_dump_json(indent=2) + "\n",
-        encoding="utf-8",
-    )
+    lock_path = config_path.with_suffix(config_path.suffix + ".lock")
+    with exclusive_file_lock(lock_path):
+        atomic_write_text(
+            config_path,
+            settings.model_dump_json(indent=2) + "\n",
+        )

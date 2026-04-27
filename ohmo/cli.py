@@ -1,76 +1,65 @@
 """CLI entry point for the ohmo personal-agent app."""
-# ohmo 个人应用的 CLI 入口点
 
-from __future__ import annotations  # 启用后注解类型（Python 3.7+ 兼容）
+from __future__ import annotations
 
-import asyncio  # 异步 I/O（用于运行后端服务）
+import asyncio
+import logging
 import sys
 from pathlib import Path
 
-import typer  # 类型提示 + CLI 框架
+import typer
 
-# ========== OpenHarness 核心导入 ==========
-from openharness.auth.manager import AuthManager  # 认证管理器（处理 API 密钥、OAuth 等）
-from openharness.config import load_settings  # 加载全局配置（~/.openharness/settings.json）
+from openharness.auth.manager import AuthManager
+from openharness.config import load_settings
 
-# ========== ohmo 网关相关导入 ==========
-from ohmo.gateway.config import load_gateway_config, save_gateway_config  # 网关配置读写
-from ohmo.gateway.models import GatewayConfig  # 网关配置数据模型
+from ohmo.gateway.config import load_gateway_config, save_gateway_config
+from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.service import (
-    OhmoGatewayService,  # 网关服务类（管理多平台消息）
-    gateway_status,  # 查询网关运行状态
-    start_gateway_process,  # 启动网关后台进程
-    stop_gateway_process,  # 停止网关进程
+    OhmoGatewayService,
+    gateway_status,
+    start_gateway_process,
+    stop_gateway_process,
 )
-
-# ========== ohmo 核心功能导入 ==========
-from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry  # 记忆管理
-from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode  # 运行时
-from ohmo.session_storage import OhmoSessionBackend  # 会话持久化
+from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry
+from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
+from ohmo.session_storage import OhmoSessionBackend
 from ohmo.workspace import (
-    get_gateway_config_path,  # 获取网关配置文件路径
-    get_workspace_root,  # 获取工作区根目录
-    get_soul_path,  # 获取 soul.md 路径
-    get_state_path,  # 获取 state.json 路径
-    get_user_path,  # 获取 user.md 路径
-    initialize_workspace,  # 初始化工作区（创建目录和模板文件）
-    workspace_health,  # 检查工作区健康状态
+    get_gateway_config_path,
+    get_workspace_root,
+    get_soul_path,
+    get_state_path,
+    get_user_path,
+    initialize_workspace,
+    workspace_health,
 )
 
 
-# ========== Typer 应用结构定义 ==========
 app = typer.Typer(
     name="ohmo",
     help="ohmo: a personal-agent app built on top of OpenHarness.",
-    invoke_without_command=True,  # 关键：没有子命令时也执行 main() 函数
-    add_completion=False,  # 不生成 shell 自动补全脚本
+    invoke_without_command=True,
+    add_completion=False,
 )
-# ========== 子命令组 ==========
-memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")  # 记忆管理子命令
-soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")  # soul.md 编辑子命令
-user_app = typer.Typer(name="user", help="Inspect or edit user.md")  # user.md 编辑子命令
-gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")  # 网关管理子命令
+memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
+soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
+user_app = typer.Typer(name="user", help="Inspect or edit user.md")
+gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
 
-# ========== 注册子命令到主应用 ==========
-app.add_typer(memory_app)  # ohmo memory ...
-app.add_typer(soul_app)    # ohmo soul ...
-app.add_typer(user_app)    # ohmo user ...
-app.add_typer(gateway_app) # ohmo gateway ...
+app.add_typer(memory_app)
+app.add_typer(soul_app)
+app.add_typer(user_app)
+app.add_typer(gateway_app)
 
-# ========== 支持的交互渠道 ==========
-_INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")  # 四大即时通讯平台
+_INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
+_WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
 
 
-# ========== UI 辅助函数：检测是否支持交互式终端 ==========
 def _can_use_questionary() -> bool:
-    """检查是否可以使用 questionary（美化交互库）"""
-    # 条件1：stdin 和 stdout 必须是真实的 TTY（终端）
+    """Return True when a real interactive terminal is available."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return False
-    # 条件2：不能被重定向（例如：ohmo | grep "xxx"）
     if sys.stdin is not sys.__stdin__ or sys.stdout is not sys.__stdout__:
         return False
-    # 条件3：questionary 库必须可用
     try:
         import questionary  # noqa: F401
     except ImportError:
@@ -155,19 +144,13 @@ def _format_provider_profile_label(info: dict[str, object]) -> str:
     return f"{label} (missing)"
 
 
-# ========== 配置向导：选择认证提供商 ==========
 def _prompt_provider_profile(workspace: str | Path) -> str:
-    """引导用户选择 API 提供商（Claude、OpenAI 等）"""
     settings = load_settings()
-    # 获取所有可用的认证配置状态
     statuses = AuthManager(settings).get_profile_statuses()
-    # 当前网关配置的提供商
     default_value = load_gateway_config(workspace).provider_profile
-
-    # 提供商提示信息（美化显示）
     hints = {
-        "claude-api": ("Claude / Kimi / GLM / MiniMax", "fg:#7aa2f7"),  # 蓝色
-        "openai-compatible": ("OpenAI / OpenRouter", "fg:#9ece6a"),  # 绿色
+        "claude-api": ("Claude / Kimi / GLM / MiniMax", "fg:#7aa2f7"),
+        "openai-compatible": ("OpenAI / OpenRouter", "fg:#9ece6a"),
     }
 
     if _can_use_questionary():
@@ -208,42 +191,28 @@ def _prompt_provider_profile(workspace: str | Path) -> str:
     )
 
 
-# ========== 配置向导：配置消息渠道 ==========
 def _prompt_channels(existing: GatewayConfig) -> tuple[list[str], dict[str, dict]]:
-    """交互式配置四大消息渠道"""
-    enabled: list[str] = []  # 启用的渠道列表
-    configs: dict[str, dict] = {}  # 各渠道的配置字典
-
+    enabled: list[str] = []
+    configs: dict[str, dict] = {}
     print("Configure channels for ohmo gateway:")
-
-    # 遍历四大消息平台
-    for channel in _INTERACTIVE_CHANNELS:  # telegram, slack, discord, feishu
+    for channel in _INTERACTIVE_CHANNELS:
         current = channel in existing.enabled_channels
         prior = dict(existing.channel_configs.get(channel, {}))
-
-        # 如果已启用，询问是否重新配置
         if current:
             enabled.append(channel)
             if not _confirm_prompt(f"Reconfigure {channel}?", default=False):
                 configs[channel] = prior
                 continue
-
-        # 如果未启用，询问是否启用
         elif not _confirm_prompt(f"Enable {channel}?", default=False):
             continue
         else:
             enabled.append(channel)
-
-        # ========== 收集渠道特定配置 ==========
-        # 通用：允许哪些用户/群组使用（"*" 表示所有人）
         allow_from_raw = _text_prompt(
-            f"{channel} allow_from (comma separated, '*' for everyone)",
-            default=",".join(prior.get("allow_from", ["*"])) or "*",
+            f"{channel} allow_from (comma separated user/chat IDs; leave blank to deny all; '*' for everyone)",
+            default=",".join(prior.get("allow_from", [])),
         )
-        allow_from = [item.strip() for item in allow_from_raw.split(",") if item.strip()] or ["*"]
+        allow_from = [item.strip() for item in allow_from_raw.split(",") if item.strip()]
         config: dict[str, object] = {"allow_from": allow_from}
-
-        # Telegram 特定配置
         if channel == "telegram":
             config["token"] = _text_prompt(
                 "Telegram bot token",
@@ -337,6 +306,22 @@ def _run_gateway_config_wizard(workspace: str | Path) -> GatewayConfig:
         "Send tool hints to channels?",
         default=existing.send_tool_hints,
     )
+    allow_remote_admin_commands = _confirm_prompt(
+        "Allow explicitly listed administrative slash commands from remote channels?",
+        default=existing.allow_remote_admin_commands,
+    )
+    default_allowlist = ", ".join(existing.allowed_remote_admin_commands)
+    allowed_remote_admin_commands: list[str] = []
+    if allow_remote_admin_commands:
+        allowlist_raw = _text_prompt(
+            "Allowed remote admin commands (comma-separated, e.g. permissions, plan)",
+            default=default_allowlist,
+        )
+        allowed_remote_admin_commands = [
+            item.strip().lstrip("/")
+            for item in allowlist_raw.split(",")
+            if item.strip()
+        ]
     config = existing.model_copy(
         update={
             "provider_profile": provider_profile,
@@ -344,6 +329,8 @@ def _run_gateway_config_wizard(workspace: str | Path) -> GatewayConfig:
             "channel_configs": channel_configs,
             "send_progress": send_progress,
             "send_tool_hints": send_tool_hints,
+            "allow_remote_admin_commands": allow_remote_admin_commands,
+            "allowed_remote_admin_commands": allowed_remote_admin_commands,
         }
     )
     save_gateway_config(config, workspace)
@@ -357,8 +344,24 @@ def _print_gateway_config_summary(config: GatewayConfig) -> None:
             + ", ".join(config.enabled_channels)
             + f" | provider_profile={config.provider_profile}"
         )
+        deny_all_channels = [
+            name for name in config.enabled_channels
+            if not list(config.channel_configs.get(name, {}).get("allow_from", []))
+        ]
+        if deny_all_channels:
+            print(
+                "Remote access denied until allow_from is configured for: "
+                + ", ".join(deny_all_channels)
+            )
     else:
         print(f"Configured provider_profile={config.provider_profile}; no channels enabled yet.")
+    if config.allow_remote_admin_commands and config.allowed_remote_admin_commands:
+        print(
+            "Remote admin opt-in enabled for: "
+            + ", ".join(f"/{name}" for name in config.allowed_remote_admin_commands)
+        )
+    else:
+        print("Remote admin commands remain local-only.")
 
 
 def _maybe_restart_gateway(*, cwd: str | Path, workspace: str | Path) -> None:
@@ -373,73 +376,74 @@ def _maybe_restart_gateway(*, cwd: str | Path, workspace: str | Path) -> None:
     print(f"ohmo gateway restarted (pid={pid})")
 
 
-# ========== 主命令：ohmo 启动入口 ⭐⭐⭐ ==========
-@app.callback(invoke_without_command=True)  # 关键装饰器：没有子命令时也执行
+def _configure_gateway_logging(workspace: str | Path | None = None) -> None:
+    """Configure foreground gateway logging."""
+    config = load_gateway_config(workspace)
+    level_name = str(config.log_level or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        force=True,
+    )
+
+
+@app.callback(invoke_without_command=True)
 def main(
-    ctx: typer.Context,  # Typer 上下文（用于检测是否调用了子命令）
-    # ========== 会话模式选项 ==========
+    ctx: typer.Context,
     print_mode: str | None = typer.Option(None, "--print", "-p", help="Run a single prompt and exit"),
     model: str | None = typer.Option(None, "--model", help="Model override for this session"),
     profile: str | None = typer.Option(None, "--profile", help="Provider profile to use"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     max_turns: int | None = typer.Option(None, "--max-turns", help="Override max turns"),
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Working directory"),
-    # ========== 隐藏选项（内部使用） ==========
-    backend_only: bool = typer.Option(False, "--backend-only", hidden=True),  # React TUI 使用
-    # ========== 会话恢复选项 ==========
+    backend_only: bool = typer.Option(False, "--backend-only", hidden=True),
     resume: str | None = typer.Option(None, "--resume", help="Resume an ohmo session by id"),
     continue_session: bool = typer.Option(False, "--continue", help="Continue the latest ohmo session"),
 ) -> None:
-    """启动 ohmo 应用或调用子命令"""
+    """Launch the ohmo app or invoke a subcommand."""
+    if ctx.invoked_subcommand is not None:
+        return
 
-    # ========== 步骤1：检查是否调用了子命令 ==========
-    if ctx.invoked_subcommand is not None:  # 例如：ohmo init, ohmo gateway start
-        return  # 直接返回，让子命令处理
-
-    # ========== 步骤2：初始化工作区 ==========
-    cwd_path = str(Path(cwd).resolve())  # 规范化工作目录
-    workspace_root = initialize_workspace(workspace)  # 创建 ~/.ohmo/ 和模板文件
-    backend = OhmoSessionBackend(workspace_root)  # 创建会话存储后端
-
-    # ========== 步骤3：恢复会话（可选） ==========
+    cwd_path = str(Path(cwd).resolve())
+    workspace_root = initialize_workspace(workspace)
+    backend = OhmoSessionBackend(workspace_root)
     restore_messages = None
-
-    if continue_session:  # --continue：恢复最新会话
+    restore_tool_metadata = None
+    if continue_session:
         latest = backend.load_latest(cwd_path)
         if latest is None:
             print("No previous ohmo session found in this directory.", file=sys.stderr)
             raise typer.Exit(1)
         restore_messages = latest.get("messages")
-
-    elif resume:  # --resume <session_id>：恢复指定会话
+        restore_tool_metadata = latest.get("tool_metadata")
+    elif resume:
         snapshot = backend.load_by_id(cwd_path, resume)
         if snapshot is None:
             print(f"ohmo session not found: {resume}", file=sys.stderr)
             raise typer.Exit(1)
         restore_messages = snapshot.get("messages")
+        restore_tool_metadata = snapshot.get("tool_metadata")
 
-    # ========== 步骤4：根据模式启动 ==========
-
-    # 模式1：backend-only（React TUI 使用）
     if backend_only:
         raise SystemExit(
             asyncio.run(
-                run_ohmo_backend(  # 调用 OpenHarness 的后端主机
+                run_ohmo_backend(
                     cwd=cwd_path,
                     workspace=workspace_root,
                     model=model,
                     max_turns=max_turns,
                     provider_profile=profile,
                     restore_messages=restore_messages,
+                    restore_tool_metadata=restore_tool_metadata,
                 )
             )
         )
 
-    # 模式2：print-mode（单次执行）
     if print_mode is not None:
         raise SystemExit(
             asyncio.run(
-                run_ohmo_print_mode(  # 运行单个提示词并退出
+                run_ohmo_print_mode(
                     prompt=print_mode,
                     cwd=cwd_path,
                     workspace=workspace_root,
@@ -450,10 +454,9 @@ def main(
             )
         )
 
-    # 模式3：React TUI（默认，交互式终端界面）
     raise SystemExit(
         asyncio.run(
-            launch_ohmo_react_tui(  # 启动 React 终端 UI
+            launch_ohmo_react_tui(
                 cwd=cwd_path,
                 workspace=workspace_root,
                 model=model,
@@ -464,11 +467,10 @@ def main(
     )
 
 
-# ========== 子命令组：工作区管理 ==========
 @app.command("init")
 def init_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory (reserved for future project overrides)"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     interactive: bool = typer.Option(
         True,
         "--interactive/--no-interactive",
@@ -497,7 +499,7 @@ def init_cmd(
 @app.command("config")
 def config_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Configure provider profile and gateway channels."""
     cwd_path = str(Path(cwd).resolve())
@@ -511,7 +513,7 @@ def config_cmd(
 @app.command("doctor")
 def doctor_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Check .ohmo workspace and provider readiness."""
     cwd_path = str(Path(cwd).resolve())
@@ -535,7 +537,7 @@ def doctor_cmd(
 
 
 @memory_app.command("list")
-def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)")) -> None:
+def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
     for path in list_memory_files(workspace):
         print(path.name)
 
@@ -544,7 +546,7 @@ def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", he
 def memory_add_cmd(
     title: str = typer.Argument(...),
     content: str = typer.Argument(...),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     path = add_memory_entry(workspace, title, content)
     print(f"Added memory entry {path.name}")
@@ -553,7 +555,7 @@ def memory_add_cmd(
 @memory_app.command("remove")
 def memory_remove_cmd(
     name: str = typer.Argument(...),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     if remove_memory_entry(workspace, name):
         print(f"Removed memory entry {name}")
@@ -575,38 +577,38 @@ def _show_or_edit(path: Path, set_text: str | None) -> None:
 
 
 @soul_app.command("show")
-def soul_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)")) -> None:
+def soul_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
     _show_or_edit(get_soul_path(workspace), None)
 
 
 @soul_app.command("edit")
 def soul_edit_cmd(
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     set_text: str | None = typer.Option(None, "--set", help="Replace soul.md with this text"),
 ) -> None:
     _show_or_edit(get_soul_path(workspace), set_text)
 
 
 @user_app.command("show")
-def user_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)")) -> None:
+def user_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
     _show_or_edit(get_user_path(workspace), None)
 
 
 @user_app.command("edit")
 def user_edit_cmd(
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     set_text: str | None = typer.Option(None, "--set", help="Replace user.md with this text"),
 ) -> None:
     _show_or_edit(get_user_path(workspace), set_text)
 
 
-# ========== 子命令组：网关管理 ==========
 @gateway_app.command("run")
 def gateway_run_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Run the ohmo gateway in the foreground."""
+    _configure_gateway_logging(workspace)
     service = OhmoGatewayService(cwd, workspace)
     raise SystemExit(asyncio.run(service.run_foreground()))
 
@@ -614,7 +616,7 @@ def gateway_run_cmd(
 @gateway_app.command("start")
 def gateway_start_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     pid = start_gateway_process(cwd, workspace)
     print(f"ohmo gateway started (pid={pid})")
@@ -623,7 +625,7 @@ def gateway_start_cmd(
 @gateway_app.command("stop")
 def gateway_stop_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     if stop_gateway_process(cwd, workspace):
         print("ohmo gateway stopped.")
@@ -634,7 +636,7 @@ def gateway_stop_cmd(
 @gateway_app.command("restart")
 def gateway_restart_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     stop_gateway_process(cwd, workspace)
     pid = start_gateway_process(cwd, workspace)
@@ -644,7 +646,7 @@ def gateway_restart_cmd(
 @gateway_app.command("status")
 def gateway_status_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory"),
-    workspace: str | None = typer.Option(None, "--workspace", help="Path to the ohmo workspace (defaults to ~/.ohmo)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     state = gateway_status(cwd, workspace)
     print(state.model_dump_json(indent=2))

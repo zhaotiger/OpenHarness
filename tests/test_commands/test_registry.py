@@ -9,12 +9,14 @@ import pytest
 
 import openharness.commands.registry as registry_module
 from openharness.commands.registry import CommandContext, create_default_command_registry
+from openharness.autopilot import RepoVerificationStep
 from openharness.config.paths import get_feedback_log_path, get_project_issue_file, get_project_pr_comments_file
 from openharness.config.settings import load_settings, save_settings, Settings
 from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.engine.query_engine import QueryEngine
 from openharness.mcp.types import McpHttpServerConfig, McpStdioServerConfig
 from openharness.permissions import PermissionChecker
+from openharness.plugins.types import PluginCommandDefinition
 from openharness.state import AppState, AppStateStore
 from openharness.tasks import get_task_manager
 from openharness.tools import create_default_tool_registry
@@ -72,6 +74,89 @@ async def test_permissions_command_persists(tmp_path: Path, monkeypatch):
 
     assert "Auto" in result.message
     assert load_settings().permission.mode == "full_auto"
+
+
+@pytest.mark.asyncio
+async def test_permissions_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/permissions set full_auto")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_permissions_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/permissions set full_auto")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/plugin list")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/plugin list")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
+async def test_reload_plugins_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/reload-plugins")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_reload_plugins_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/reload-plugins")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
+async def test_memory_show_rejects_path_traversal(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    registry = create_default_command_registry()
+    command, args = registry.lookup("/memory show ../../../../../../etc/hosts")
+    assert command is not None
+
+    result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    assert result.message == "Memory entry path must stay within the project memory directory."
+
+
+@pytest.mark.asyncio
+async def test_memory_show_reads_normal_entries_with_md_fallback(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    registry = create_default_command_registry()
+
+    add_command, add_args = registry.lookup("/memory add Notes :: hello world")
+    assert add_command is not None
+    await add_command.handler(add_args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    show_command, show_args = registry.lookup("/memory show Notes")
+    result = await show_command.handler(show_args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
+
+    assert "hello world" in result.message
 
 
 @pytest.mark.asyncio
@@ -196,6 +281,103 @@ async def test_provider_command_switches_profile_and_requests_runtime_refresh(tm
     assert loaded.active_profile == "kimi-anthropic"
     assert loaded.base_url == "https://api.moonshot.cn/anthropic"
     assert loaded.model == "kimi-k2.5"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_command_add_list_and_complete(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+
+    add_command, add_args = registry.lookup("/autopilot add idea Build unified queue :: intake from issues and prs")
+    assert add_command is not None
+    add_result = await add_command.handler(add_args, context)
+    assert "Queued autopilot card" in add_result.message
+
+    list_command, list_args = registry.lookup("/autopilot list")
+    assert list_command is not None
+    list_result = await list_command.handler(list_args, context)
+    assert "Build unified queue" in list_result.message
+
+    next_command, next_args = registry.lookup("/autopilot next")
+    next_result = await next_command.handler(next_args, context)
+    assert "Build unified queue" in next_result.message
+    card_id = next_result.message.split()[0]
+
+    complete_command, complete_args = registry.lookup(f"/autopilot complete {card_id} implemented")
+    complete_result = await complete_command.handler(complete_args, context)
+    assert "-> completed" in complete_result.message
+
+    status_command, status_args = registry.lookup("/autopilot status")
+    status_result = await status_command.handler(status_args, context)
+    assert "- completed: 1" in status_result.message
+
+
+@pytest.mark.asyncio
+async def test_autopilot_command_export_dashboard(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+
+    command, args = registry.lookup("/autopilot export-dashboard")
+    assert command is not None
+    result = await command.handler(args, context)
+
+    assert "Exported autopilot dashboard:" in result.message
+    output_dir = Path(result.message.split(": ", 1)[1])
+    assert (output_dir / "index.html").exists()
+    assert (output_dir / "snapshot.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_ship_command_queues_and_executes_card(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+
+    async def fake_run_agent_prompt(self, prompt: str, *, model, max_turns, permission_mode, cwd=None):
+        return "Implemented the requested feature."
+
+    def fake_run_verification_steps(self, policies, *, cwd=None):
+        return [RepoVerificationStep(command="uv run pytest -q", returncode=0, status="success")]
+
+    monkeypatch.setattr(
+        "openharness.autopilot.service.RepoAutopilotStore._run_agent_prompt",
+        fake_run_agent_prompt,
+    )
+    monkeypatch.setattr(
+        "openharness.autopilot.service.RepoAutopilotStore._run_verification_steps",
+        fake_run_verification_steps,
+    )
+
+    command, args = registry.lookup("/ship Build autopilot tick :: end-to-end automation")
+    assert command is not None
+    result = await command.handler(args, context)
+
+    assert "-> completed" in result.message
+    assert "run report:" in result.message
+    assert "verification report:" in result.message
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_registers_and_submits_prompt(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry(
+        plugin_commands=[
+            PluginCommandDefinition(
+                name="fixture:ops:restart",
+                description="Restart services safely",
+                content="Base workflow\n\n$ARGUMENTS",
+                user_invocable=True,
+            )
+        ]
+    )
+    command, args = registry.lookup("/fixture:ops:restart api")
+    assert command is not None
+
+    result = await command.handler(args, _make_context(tmp_path))
+
+    assert result.submit_prompt == "Base workflow\n\napi"
 
 
 @pytest.mark.asyncio
@@ -474,6 +656,30 @@ async def test_agents_session_files_and_reload_plugins_commands(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_agents_help_and_subagents_alias(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+
+    agents_help_command, agents_help_args = registry.lookup("/agents help")
+    assert agents_help_command is not None
+    agents_help_result = await agents_help_command.handler(agents_help_args, context)
+    assert "Subagent guide:" in agents_help_result.message
+    assert 'subagent_type="worker"' in agents_help_result.message
+
+    subagents_command, subagents_args = registry.lookup("/subagents")
+    assert subagents_command is not None
+    subagents_result = await subagents_command.handler(subagents_args, context)
+    assert "Subagent guide:" in subagents_result.message
+
+    agents_command, agents_args = registry.lookup("/agents")
+    assert agents_command is not None
+    agents_result = await agents_command.handler(agents_args, context)
+    assert "Subagent guide:" in agents_result.message
+
+
+@pytest.mark.asyncio
 async def test_init_and_bridge_commands(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
@@ -635,3 +841,27 @@ async def test_git_commands_report_repository_state(tmp_path: Path, monkeypatch)
     commit_command, commit_args = registry.lookup("/commit initial commit")
     commit_result = await commit_command.handler(commit_args, context)
     assert "commit" in commit_result.message.lower()
+
+
+def test_quit_is_alias_for_exit():
+    """Regression for #183: /quit should resolve to the same handler as /exit."""
+    reg = create_default_command_registry()
+
+    exit_cmd, _ = reg.lookup("/exit")
+    quit_cmd, _ = reg.lookup("/quit")
+
+    assert exit_cmd is quit_cmd
+    assert quit_cmd.name == "exit"
+
+
+def test_help_and_list_do_not_duplicate_aliases():
+    """Aliases share a SlashCommand object; help/listing must not repeat it."""
+    reg = create_default_command_registry()
+
+    names = [cmd.name for cmd in reg.list_commands()]
+    assert names.count("exit") == 1
+    assert "quit" not in names  # alias is resolvable via lookup, not listed
+
+    help_text = reg.help_text()
+    assert help_text.count("/exit ") == 1
+    assert "/quit" not in help_text

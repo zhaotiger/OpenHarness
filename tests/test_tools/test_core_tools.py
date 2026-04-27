@@ -111,7 +111,9 @@ async def test_skill_todo_and_config_tools(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
     skills_dir = tmp_path / "config" / "skills"
     skills_dir.mkdir(parents=True)
-    (skills_dir / "pytest.md").write_text("# Pytest\nHelpful pytest notes.\n", encoding="utf-8")
+    pytest_dir = skills_dir / "pytest"
+    pytest_dir.mkdir()
+    (pytest_dir / "SKILL.md").write_text("# Pytest\nHelpful pytest notes.\n", encoding="utf-8")
 
     skill_result = await SkillTool().execute(
         SkillToolInput(name="Pytest"),
@@ -131,6 +133,30 @@ async def test_skill_todo_and_config_tools(tmp_path: Path, monkeypatch):
         ToolExecutionContext(cwd=tmp_path),
     )
     assert config_result.output == "Updated theme"
+
+
+@pytest.mark.asyncio
+async def test_todo_write_upsert(tmp_path: Path):
+    tool = TodoWriteTool()
+    ctx = ToolExecutionContext(cwd=tmp_path)
+
+    await tool.execute(TodoWriteToolInput(item="task A"), ctx)
+    await tool.execute(TodoWriteToolInput(item="task B"), ctx)
+
+    # Marking done should update in-place, not append a duplicate
+    result = await tool.execute(TodoWriteToolInput(item="task A", checked=True), ctx)
+    assert result.is_error is False
+
+    content = (tmp_path / "TODO.md").read_text(encoding="utf-8")
+    assert content.count("task A") == 1
+    assert "- [x] task A" in content
+    assert "- [ ] task A" not in content
+    assert "- [ ] task B" in content
+
+    # Calling again with same state is a no-op
+    noop = await tool.execute(TodoWriteToolInput(item="task A", checked=True), ctx)
+    assert "No change" in noop.output
+    assert (tmp_path / "TODO.md").read_text(encoding="utf-8").count("task A") == 1
 
 
 @pytest.mark.asyncio

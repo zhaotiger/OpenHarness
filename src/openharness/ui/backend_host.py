@@ -9,16 +9,18 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import uuid4
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.auth.manager import AuthManager
-from openharness.config.settings import CLAUDE_MODEL_ALIAS_OPTIONS, display_model_setting
+from openharness.config.settings import CLAUDE_MODEL_ALIAS_OPTIONS, resolve_model_setting
 from openharness.bridge import get_bridge_manager
 from openharness.themes import list_themes
 from openharness.engine.stream_events import (
     AssistantTextDelta,
     AssistantTurnComplete,
+    CompactProgressEvent,
     ErrorEvent,
     StatusEvent,
     StreamEvent,
@@ -50,13 +52,18 @@ class BackendHostConfig:
     api_format: str | None = None
     active_profile: str | None = None
     api_client: SupportsStreamingMessages | None = None
+    cwd: str | None = None
     restore_messages: list[dict] | None = None
+    restore_tool_metadata: dict[str, object] | None = None
     enforce_max_turns: bool = True
+    permission_mode: str | None = None
     session_backend: SessionBackend | None = None
+    extra_skill_dirs: tuple[str, ...] = ()
+    extra_plugin_roots: tuple[str, ...] = ()
 
 
 class ReactBackendHost:
-    """Drive the OpenHarness runtime over a structured stdin/stdout protocol."""  # 通过结构化的标准输入/输出协议来驱动 OpenHarness 运行时环境
+    """Drive the OpenHarness runtime over a structured stdin/stdout protocol."""
 
     def __init__(self, config: BackendHostConfig) -> None:
         self._config = config
@@ -65,9 +72,10 @@ class ReactBackendHost:
         self._request_queue: asyncio.Queue[FrontendRequest] = asyncio.Queue()
         self._permission_requests: dict[str, asyncio.Future[bool]] = {}
         self._question_requests: dict[str, asyncio.Future[str]] = {}
+        self._permission_lock = asyncio.Lock()
         self._busy = False
         self._running = True
-        # Track last tool input per name for rich event emission  按名称跟踪每次工具输入信息，以便生成详细事件记录
+        # Track last tool input per name for rich event emission
         self._last_tool_inputs: dict[str, dict] = {}
 
     async def run(self) -> int:
@@ -80,43 +88,35 @@ class ReactBackendHost:
             api_format=self._config.api_format,
             active_profile=self._config.active_profile,
             api_client=self._config.api_client,
+            cwd=self._config.cwd,
             restore_messages=self._config.restore_messages,
+            restore_tool_metadata=self._config.restore_tool_metadata,
             permission_prompt=self._ask_permission,
             ask_user_prompt=self._ask_question,
             enforce_max_turns=self._config.enforce_max_turns,
+            permission_mode=self._config.permission_mode,
             session_backend=self._config.session_backend,
+            extra_skill_dirs=self._config.extra_skill_dirs,
+            extra_plugin_roots=self._config.extra_plugin_roots,
         )
-        """
-          执行所有 SESSION_START 钩子
-              ├─ 钩子1: 初始化日志
-              ├─ 钩子2: 加载环境变量
-              ├─ 钩子3: 检查依赖
-              └─ 钩子N: 自定义逻辑
-        """
         await start_runtime(self._bundle)
-        await self._emit(           # 发送 ready 事件
+        await self._emit(
             BackendEvent.ready(
                 self._bundle.app_state.get(),
                 get_task_manager().list_tasks(),
                 [f"/{command.name}" for command in self._bundle.commands.list_commands()],
             )
         )
-        await self._emit(self._status_snapshot())   #发送 state_snapshot 事件
+        await self._emit(self._status_snapshot())
 
-        reader = asyncio.create_task(self._read_requests()) #  接收控制台输入 放入 _request_queue 队列
+        reader = asyncio.create_task(self._read_requests())
         try:
             while self._running:
-                request = await self._request_queue.get()   # 处理 _request_queue 队列中的消息
+                request = await self._request_queue.get()
                 if request.type == "shutdown":
                     await self._emit(BackendEvent(type="shutdown"))
                     break
-                if request.type == "permission_response":
-                    if request.request_id in self._permission_requests:
-                        self._permission_requests[request.request_id].set_result(bool(request.allowed))
-                    continue
-                if request.type == "question_response":
-                    if request.request_id in self._question_requests:
-                        self._question_requests[request.request_id].set_result(request.answer or "")
+                if request.type in ("permission_response", "question_response"):
                     continue
                 if request.type == "list_sessions":
                     await self._handle_list_sessions()
@@ -125,7 +125,7 @@ class ReactBackendHost:
                     await self._handle_select_command(request.command or "")
                     continue
                 if request.type == "apply_select_command":
-                    if self._busy:                      # 确保同时只有一个命令在执行
+                    if self._busy:
                         await self._emit(BackendEvent(type="error", message="Session is busy"))
                         continue
                     self._busy = True
@@ -151,7 +151,7 @@ class ReactBackendHost:
                     continue
                 self._busy = True
                 try:
-                    should_continue = await self._process_line(line)   # 处理发来消息
+                    should_continue = await self._process_line(line)
                 finally:
                     self._busy = False
                 if not should_continue:
@@ -168,7 +168,6 @@ class ReactBackendHost:
     async def _read_requests(self) -> None:
         while True:
             raw = await asyncio.to_thread(sys.stdin.buffer.readline)
-            # 如果读到空数据（EOF），说明前端断开连接
             if not raw:
                 await self._request_queue.put(FrontendRequest(type="shutdown"))
                 return
@@ -176,38 +175,49 @@ class ReactBackendHost:
             if not payload:
                 continue
             try:
-                # 将 JSON 字符串解析为 FrontendRequest 对象
                 request = FrontendRequest.model_validate_json(payload)
             except Exception as exc:  # pragma: no cover - defensive protocol handling
                 await self._emit(BackendEvent(type="error", message=f"Invalid request: {exc}"))
                 continue
-            # 将请求放入队列，供后续处理
+            if request.type == "permission_response" and request.request_id in self._permission_requests:
+                future = self._permission_requests[request.request_id]
+                if not future.done():
+                    future.set_result(bool(request.allowed))
+                continue
+            if request.type == "question_response" and request.request_id in self._question_requests:
+                future = self._question_requests[request.request_id]
+                if not future.done():
+                    future.set_result(request.answer or "")
+                continue
             await self._request_queue.put(request)
 
     async def _process_line(self, line: str, *, transcript_line: str | None = None) -> bool:
         assert self._bundle is not None
-        # 确认收到用户消息
         await self._emit(
             BackendEvent(type="transcript_item", item=TranscriptItem(role="user", text=transcript_line or line))
         )
-        # UI 层面的"打印函数"
+
         async def _print_system(message: str) -> None:
             await self._emit(
                 BackendEvent(type="transcript_item", item=TranscriptItem(role="system", text=message))
             )
-        """
-            事件转换器 (将后端的内部事件转换为前端可显示的事件)
-        
-          | 后端事件（内部）       | 前端事件           | 作用                  |
-          |------------------------|--------------------|-----------------------|
-          | AssistantTextDelta     | assistant_delta    | AI 流式输出的增量文本 |
-          | AssistantTurnComplete  | assistant_complete | AI 回复完成           |
-          | ToolExecutionStarted   | tool_started       | 工具开始执行          |
-          | ToolExecutionCompleted | tool_completed     | 工具执行完成          |
-        """
+
         async def _render_event(event: StreamEvent) -> None:
             if isinstance(event, AssistantTextDelta):
                 await self._emit(BackendEvent(type="assistant_delta", message=event.text))
+                return
+            if isinstance(event, CompactProgressEvent):
+                await self._emit(
+                    BackendEvent(
+                        type="compact_progress",
+                        compact_phase=event.phase,
+                        compact_trigger=event.trigger,
+                        attempt=event.attempt,
+                        compact_checkpoint=event.checkpoint,
+                        compact_metadata=event.metadata,
+                        message=event.message,
+                    )
+                )
                 return
             if isinstance(event, AssistantTurnComplete):
                 await self._emit(
@@ -286,7 +296,7 @@ class ReactBackendHost:
                 )
                 return
 
-        async def _clear_output() -> None:          # 清除会话记录（前端清空对话历史） 和打印函数对应
+        async def _clear_output() -> None:
             await self._emit(BackendEvent(type="clear_transcript"))
 
         should_continue = await handle_line(
@@ -296,9 +306,9 @@ class ReactBackendHost:
             render_event=_render_event,
             clear_output=_clear_output,
         )
-        await self._emit(self._status_snapshot())                               # 发送当前状态
-        await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))  # 发送当前任务列表
-        await self._emit(BackendEvent(type="line_complete"))        # 单行处理完成（用户输入的一行已处理完毕）
+        await self._emit(self._status_snapshot())
+        await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
+        await self._emit(BackendEvent(type="line_complete"))
         return should_continue
 
     async def _apply_select_command(self, command_name: str, value: str) -> bool:
@@ -395,7 +405,7 @@ class ReactBackendHost:
         settings = self._bundle.current_settings()
         state = self._bundle.app_state.get()
         _, active_profile = settings.resolve_profile()
-        current_model = display_model_setting(active_profile)
+        current_model = settings.model
 
         if command == "provider":
             statuses = AuthManager(settings).get_profile_statuses()
@@ -604,12 +614,14 @@ class ReactBackendHost:
             ]
         provider_name = provider.lower()
         if provider_name in {"anthropic", "anthropic_claude"}:
+            resolved_current = resolve_model_setting(current_model, provider_name)
             return [
                 {
                     "value": value,
                     "label": label,
                     "description": description,
-                    "active": value == current_model,
+                    "active": value == current_model
+                    or resolve_model_setting(value, provider_name) == resolved_current,
                 }
                 for value, label, description in CLAUDE_MODEL_ALIAS_OPTIONS
             ]
@@ -645,6 +657,13 @@ class ReactBackendHost:
                     ("gemini-2.5-flash", "Gemini Flash"),
                 ]
             )
+        elif provider_name == "minimax":
+            families.extend(
+                [
+                    ("MiniMax-M2.7", "MiniMax flagship"),
+                    ("MiniMax-M2.7-highspeed", "MiniMax fast"),
+                ]
+            )
 
         seen: set[str] = set()
         options: list[dict[str, object]] = []
@@ -663,27 +682,28 @@ class ReactBackendHost:
         return options
 
     async def _ask_permission(self, tool_name: str, reason: str) -> bool:
-        request_id = uuid4().hex
-        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        self._permission_requests[request_id] = future
-        await self._emit(
-            BackendEvent(
-                type="modal_request",
-                modal={
-                    "kind": "permission",
-                    "request_id": request_id,
-                    "tool_name": tool_name,
-                    "reason": reason,
-                },
+        async with self._permission_lock:
+            request_id = uuid4().hex
+            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            self._permission_requests[request_id] = future
+            await self._emit(
+                BackendEvent(
+                    type="modal_request",
+                    modal={
+                        "kind": "permission",
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "reason": reason,
+                    },
+                )
             )
-        )
-        try:
-            return await asyncio.wait_for(future, timeout=300)
-        except asyncio.TimeoutError:
-            log.warning("Permission request %s timed out after 300s, denying", request_id)
-            return False
-        finally:
-            self._permission_requests.pop(request_id, None)
+            try:
+                return await asyncio.wait_for(future, timeout=300)
+            except asyncio.TimeoutError:
+                log.warning("Permission request %s timed out after 300s, denying", request_id)
+                return False
+            finally:
+                self._permission_requests.pop(request_id, None)
 
     async def _ask_question(self, question: str) -> str:
         request_id = uuid4().hex
@@ -706,7 +726,7 @@ class ReactBackendHost:
 
     async def _emit(self, event: BackendEvent) -> None:
         log.debug("emit event: type=%s tool=%s", event.type, getattr(event, "tool_name", None))
-        async with self._write_lock:                # 获取锁自动释放 （确保同一时刻只有一个协程能写入标准输出，避免数据交错混乱。）
+        async with self._write_lock:
             payload = _PROTOCOL_PREFIX + event.model_dump_json() + "\n"
             buffer = getattr(sys.stdout, "buffer", None)
             if buffer is not None:
@@ -729,8 +749,12 @@ async def run_backend_host(
     cwd: str | None = None,
     api_client: SupportsStreamingMessages | None = None,
     restore_messages: list[dict] | None = None,
+    restore_tool_metadata: dict[str, object] | None = None,
     enforce_max_turns: bool = True,
+    permission_mode: str | None = None,
     session_backend: SessionBackend | None = None,
+    extra_skill_dirs: tuple[str | Path, ...] = (),
+    extra_plugin_roots: tuple[str | Path, ...] = (),
 ) -> int:
     """Run the structured React backend host."""
     if cwd:
@@ -745,9 +769,14 @@ async def run_backend_host(
             api_format=api_format,
             active_profile=active_profile,
             api_client=api_client,
+            cwd=cwd,
             restore_messages=restore_messages,
+            restore_tool_metadata=restore_tool_metadata,
             enforce_max_turns=enforce_max_turns,
+            permission_mode=permission_mode,
             session_backend=session_backend,
+            extra_skill_dirs=tuple(str(Path(path).expanduser().resolve()) for path in extra_skill_dirs),
+            extra_plugin_roots=tuple(str(Path(path).expanduser().resolve()) for path in extra_plugin_roots),
         )
     )
     return await host.run()

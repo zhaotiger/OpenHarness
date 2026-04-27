@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useDeferredValue, useEffect, useMemo, useState} from 'react';
 import {Box, Text, useApp, useInput} from 'ink';
 
 import {CommandPicker} from './components/CommandPicker.js';
@@ -64,11 +64,19 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 	const [modalInput, setModalInput] = useState('');
 	const [history, setHistory] = useState<string[]>([]);
 	const [historyIndex, setHistoryIndex] = useState(-1);
+	const [lastEscapeAt, setLastEscapeAt] = useState(0);
 	const [scriptIndex, setScriptIndex] = useState(0);
 	const [pickerIndex, setPickerIndex] = useState(0);
 	const [selectModal, setSelectModal] = useState<SelectModalState>(null);
 	const [selectIndex, setSelectIndex] = useState(0);
 	const session = useBackendSession(config, () => exit());
+	const deferredTranscript = useDeferredValue(session.transcript);
+	const deferredAssistantBuffer = useDeferredValue(session.assistantBuffer);
+	const deferredStatus = useDeferredValue(session.status);
+	const deferredTasks = useDeferredValue(session.tasks);
+	const deferredTodoMarkdown = useDeferredValue(session.todoMarkdown);
+	const deferredSwarmTeammates = useDeferredValue(session.swarmTeammates);
+	const deferredSwarmNotifications = useDeferredValue(session.swarmNotifications);
 
 	useEffect(() => {
 		const nextTheme = session.status.theme;
@@ -79,8 +87,8 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 
 	// Current tool name for spinner
 	const currentToolName = useMemo(() => {
-		for (let i = session.transcript.length - 1; i >= 0; i--) {
-			const item = session.transcript[i];
+		for (let i = deferredTranscript.length - 1; i >= 0; i--) {
+			const item = deferredTranscript[i];
 			if (item.role === 'tool') {
 				return item.tool_name ?? 'tool';
 			}
@@ -89,7 +97,7 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			}
 		}
 		return undefined;
-	}, [session.transcript]);
+	}, [deferredTranscript]);
 
 	// Command hints
 	const commandHints = useMemo(() => {
@@ -101,6 +109,7 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 	}, [session.commands, input]);
 
 	const showPicker = commandHints.length > 0 && !session.busy && !session.modal && !selectModal;
+	const outputStyle = String(session.status.output_style ?? 'default');
 
 	useEffect(() => {
 		setPickerIndex(0);
@@ -167,10 +176,17 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 	};
 
 	useInput((chunk, key) => {
+		const isPaste = chunk.length > 1 && !key.ctrl && !key.meta;
+
 		// Ctrl+C → exit
 		if (key.ctrl && chunk === 'c') {
 			session.sendRequest({type: 'shutdown'});
 			exit();
+			return;
+		}
+
+		// Let ink-text-input handle pasted text directly.
+		if (isPaste) {
 			return;
 		}
 
@@ -281,7 +297,11 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			if (key.tab) {
 				const selected = commandHints[pickerIndex];
 				if (selected) {
-					setInput(selected + ' ');
+					// Complete to the selected command with no trailing space —
+					// the user can hit Enter immediately to run it, or keep
+					// typing to add args. The trailing space made it look like
+					// Tab was "committing" with a token, which broke the flow.
+					setInput(selected);
 				}
 				return;
 			}
@@ -289,6 +309,18 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 				setInput('');
 				return;
 			}
+		}
+
+		if (key.escape) {
+			const now = Date.now();
+			if (input && now - lastEscapeAt < 500) {
+				setInput('');
+				setHistoryIndex(-1);
+				setLastEscapeAt(0);
+				return;
+			}
+			setLastEscapeAt(now);
+			return;
 		}
 
 		// --- History navigation ---
@@ -360,9 +392,10 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			{/* Conversation area */}
 			<Box flexDirection="column" flexGrow={1}>
 				<ConversationView
-					items={session.transcript}
-					assistantBuffer={session.assistantBuffer}
-					showWelcome={session.ready}
+					items={deferredTranscript}
+					assistantBuffer={deferredAssistantBuffer}
+					showWelcome={session.ready && outputStyle !== 'codex'}
+					outputStyle={outputStyle}
 				/>
 			</Box>
 
@@ -391,18 +424,18 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			) : null}
 
 			{/* Todo panel */}
-			{session.ready && session.todoMarkdown ? (
-				<TodoPanel markdown={session.todoMarkdown} />
+			{session.ready && deferredTodoMarkdown ? (
+				<TodoPanel markdown={deferredTodoMarkdown} />
 			) : null}
 
 			{/* Swarm panel */}
-			{session.ready && (session.swarmTeammates.length > 0 || session.swarmNotifications.length > 0) ? (
-				<SwarmPanel teammates={session.swarmTeammates} notifications={session.swarmNotifications} />
+			{session.ready && (deferredSwarmTeammates.length > 0 || deferredSwarmNotifications.length > 0) ? (
+				<SwarmPanel teammates={deferredSwarmTeammates} notifications={deferredSwarmNotifications} />
 			) : null}
 
 			{/* Status bar (only after backend is ready) */}
 			{session.ready ? (
-				<StatusBar status={session.status} tasks={session.tasks} activeToolName={session.busy ? currentToolName : undefined} />
+				<StatusBar status={deferredStatus} tasks={deferredTasks} activeToolName={session.busy ? currentToolName : undefined} />
 			) : null}
 
 			{/* Input — show loading indicator until backend is ready */}
@@ -417,14 +450,16 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 					setInput={setInput}
 					onSubmit={onSubmit}
 					toolName={session.busy ? currentToolName : undefined}
+					statusLabel={session.busy ? (session.busyLabel ?? (currentToolName ? `Running ${currentToolName}...` : 'Running agent loop...')) : undefined}
 					suppressSubmit={showPicker}
 				/>
 			)}
 
 			{/* Keyboard hints (only after backend is ready) */}
-			{session.ready && !session.modal && !session.busy && !selectModal ? (
+			{session.ready && !session.modal && !selectModal ? (
 				<Box>
 					<Text dimColor>
+						<Text color={theme.colors.primary}>shift+enter</Text> newline{'  '}
 						<Text color={theme.colors.primary}>enter</Text> send{'  '}
 						<Text color={theme.colors.primary}>/</Text> commands{'  '}
 						<Text color={theme.colors.primary}>{'\u2191\u2193'}</Text> history{'  '}
