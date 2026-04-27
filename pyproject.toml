@@ -50,9 +50,10 @@ openharness = "openharness.cli:app"
 oh = "openharness.cli:app"
 openh = "openharness.cli:app"
 ohmo = "ohmo.cli:app"
+ohqa = "ohqa.cli:app"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/openharness", "ohmo"]
+packages = ["src/openharness", "ohmo", "ohqa"]
 
 [tool.hatch.build]
 exclude = [
